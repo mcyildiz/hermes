@@ -51,7 +51,10 @@ std::vector<int> parse_list(const char* s) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: %s <input> [--place] [--save out.hdb] [--gcell-rows R] [--threads 1,4,0]\n", argv[0]);
+    std::fprintf(stderr,
+                 "usage: %s <input> [--place] [--save out.hdb] [--gcell-rows R] [--threads 1,4,0] [--seed S]\n"
+                 "       [--inc-penalty P] [--repair-iters N] [--skip-sweep]\n",
+                 argv[0]);
     return 2;
   }
   log::set_level("", log::Level::Warn);

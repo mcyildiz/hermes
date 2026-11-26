@@ -67,6 +67,19 @@ struct GBox {
   long long area() const { return empty() ? 0 : static_cast<long long>(x1 - x0 + 1) * (y1 - y0 + 1); }
 };
 
+/// Where a reroute may change routes: a box, optionally restricted to the
+/// GCells marked in `mask` (row-major over the grid).
+struct Region {
+  GBox b;
+  const std::vector<std::uint8_t>* mask = nullptr;
+  int nx = 0;
+  Region(GBox box = {}, const std::vector<std::uint8_t>* m = nullptr, int w = 0) : b(box), mask(m), nx(w) {}
+  bool contains(int x, int y) const {
+    return b.contains(x, y) && (!mask || (*mask)[static_cast<std::size_t>(y) * nx + x]);
+  }
+  bool full(int gx, int gy) const { return !mask && b.x0 == 0 && b.y0 == 0 && b.x1 == gx - 1 && b.y1 == gy - 1; }
+};
+
 /// Per-thread search scratch, sized to the largest grid seen. Stamps avoid
 /// clearing arrays between searches.
 struct Scratch {
@@ -195,6 +208,9 @@ struct GlobalRouter::State {
   std::vector<std::uint32_t> vias;
   std::uint64_t macro_key = 0;
   std::vector<std::uint8_t> oflag;  // scratch: overflowed edge in the current window
+  std::vector<std::uint8_t> mask;   // scratch: repair region GCells
+  std::vector<std::int32_t> base;   // scratch: edge use before an incremental reroute
+  std::vector<std::uint8_t> retry_full;  // net failed a local reroute: next time whole
 
   Listener listener;
   Design* attached = nullptr;
@@ -224,7 +240,8 @@ struct GlobalRouter::State {
     const auto [x1, y1] = g.grid().bin_of({std::max(r.xlo, r.xhi - 1), std::max(r.ylo, r.yhi - 1)});
     return {x0, y0, x1, y1};
   }
-  bool edge_in(std::uint32_t e, const GBox& b) const {
+  template <class B>
+  bool edge_in(std::uint32_t e, const B& b) const {
     const auto [a, c] = g.ends(e);
     return b.contains(g.node_x(a), g.node_y(a)) && b.contains(g.node_x(c), g.node_y(c));
   }
@@ -360,7 +377,7 @@ void pattern_route(const Ctx& c, int u, int v, std::vector<std::uint32_t>& out) 
 
 /// A* from `sources` to `target` inside window w. Appends the path's new
 /// edges (marking them own) and its nodes. False if unreachable.
-bool maze_route(const Ctx& c, const GBox& w, std::span<const int> sources, int target,
+bool maze_route(const Ctx& c, const GBox& w, const Region& F, std::span<const int> sources, int target,
                 std::vector<std::uint32_t>& out, std::vector<int>* path_nodes) {
   Scratch& sc = c.sc;
   const RouteGraph& g = c.g;
@@ -373,7 +390,7 @@ bool maze_route(const Ctx& c, const GBox& w, std::span<const int> sources, int t
     return a.first > b.first || (a.first == b.first && a.second > b.second);
   };
   for (int s : sources) {
-    if (!w.contains(g.node_x(s), g.node_y(s))) continue;
+    if (!w.contains(g.node_x(s), g.node_y(s)) || !F.contains(g.node_x(s), g.node_y(s))) continue;
     if (sc.nstamp[static_cast<std::size_t>(s)] == sc.ns) continue;
     sc.nstamp[static_cast<std::size_t>(s)] = sc.ns;
     sc.dist[static_cast<std::size_t>(s)] = 0.0f;
@@ -394,6 +411,7 @@ bool maze_route(const Ctx& c, const GBox& w, std::span<const int> sources, int t
     }
     const int x = g.node_x(n), y = g.node_y(n);
     auto relax = [&](int m, std::uint32_t e) {
+      if (F.mask && !(*F.mask)[static_cast<std::size_t>(m)]) return;
       const float nd = dn + edge_cost(c, e);
       const std::size_t mi = static_cast<std::size_t>(m);
       if (sc.nstamp[mi] != sc.ns || nd < sc.dist[mi]) {
@@ -429,7 +447,7 @@ enum class Mode { Pattern, Maze };
 /// (not inside F); `pins` its pin GCells. Appends the new edges (all inside
 /// F, sorted, distinct) to `added`. Returns false if some part of the net
 /// cannot be reached from inside F (then `added` is meaningless).
-bool connect_net(const Ctx& c, std::span<const int> pins, std::span<const std::uint32_t> kept, const GBox& F,
+bool connect_net(const Ctx& c, std::span<const int> pins, std::span<const std::uint32_t> kept, const Region& F,
                  Mode mode, std::vector<std::uint32_t>& added) {
   const RouteGraph& g = c.g;
   Scratch& sc = c.sc;
@@ -509,14 +527,15 @@ bool connect_net(const Ctx& c, std::span<const int> pins, std::span<const std::u
         GBox w;
         w.add(g.node_x(un), g.node_y(un));
         w.add(g.node_x(vn), g.node_y(vn));
-        w = w.expanded(c.o.maze_margin, g.nx(), g.ny()).intersect(F);
+        w = w.expanded(c.o.maze_margin, g.nx(), g.ny()).intersect(F.b);
         srcs.clear();
         srcs.push_back(un);
         if (use_tree)
           for (int t : tree)
             if (w.contains(g.node_x(t), g.node_y(t))) srcs.push_back(t);
-        ok = maze_route(c, w, srcs, vn, added, use_tree ? &tree : nullptr);
+        ok = maze_route(c, w, F, srcs, vn, added, use_tree ? &tree : nullptr);
       }
+      if (!ok && F.mask) return false;  // no path inside the region
       if (!ok) {
         pattern_route(c, un, vn, added);
         if (use_tree)
@@ -554,30 +573,53 @@ void assign_layers(RouteGraph& g, std::span<const std::uint32_t> edges, std::spa
     return static_cast<long long>(g.node_x(n)) * g.ny() + g.node_y(n);
   };
   std::sort(vs.begin(), vs.end(), [&](std::size_t a, std::size_t b) { return vkey(a) < vkey(b); });
+  // One straight run: dynamic programming over (edge, layer) so a run stays
+  // on one layer unless overflow makes a layer change (vias) cheaper.
+  //   edge cost   = 100 * overflow + utilization + 0.25 * |rank - preferred| / len
+  //   layer change = 2 vias per rank step (layers of a direction alternate)
+  std::vector<double> dp, nd;
+  std::vector<std::uint8_t> from;
   auto do_run = [&](std::span<const std::size_t> run, const std::vector<int>& ls) {
     if (ls.empty()) return;
-    const int pref = std::min(length_tier(static_cast<int>(run.size())), static_cast<int>(ls.size()) - 1);
-    int best_l = ls[0];
-    double best = std::numeric_limits<double>::max();
-    for (int r = 0; r < static_cast<int>(ls.size()); ++r) {
+    const int R = static_cast<int>(ls.size());
+    const std::size_t len = run.size();
+    const int pref = std::min(length_tier(static_cast<int>(len)), R - 1);
+    auto cost = [&](std::size_t k, int r) {
       const int l = ls[static_cast<std::size_t>(r)];
-      double ovf = 0.0, util = 0.0;
-      for (std::size_t i : run) {
-        const std::uint32_t e = edges[i];
-        const double cap = g.layer_cap(l, e), u = g.layer_use(l, e) + 1.0;
-        if (u > cap + 1e-4) ovf += u - cap;
-        util += cap > 0 ? u / cap : 10.0;
+      const std::uint32_t e = edges[run[k]];
+      const double cap = g.layer_cap(l, e), u = g.layer_use(l, e) + 1.0;
+      const double ovf = u > cap + 1e-4 ? u - cap : 0.0;
+      return 100.0 * ovf + (cap > 0 ? u / cap : 10.0) + 0.25 * std::abs(r - pref) / static_cast<double>(len);
+    };
+    constexpr double kVia = 1.0;
+    dp.assign(static_cast<std::size_t>(R), 0.0);
+    from.assign(len * static_cast<std::size_t>(R), 0);
+    for (int r = 0; r < R; ++r) dp[static_cast<std::size_t>(r)] = cost(0, r);
+    for (std::size_t k = 1; k < len; ++k) {
+      nd.assign(static_cast<std::size_t>(R), 0.0);
+      for (int r = 0; r < R; ++r) {
+        double best = std::numeric_limits<double>::max();
+        int arg = r;
+        for (int q = 0; q < R; ++q) {
+          const double v = dp[static_cast<std::size_t>(q)] + 2.0 * kVia * std::abs(r - q);
+          if (v < best || (v == best && q == r)) {
+            best = v;
+            arg = q;
+          }
+        }
+        nd[static_cast<std::size_t>(r)] = best + cost(k, r);
+        from[k * static_cast<std::size_t>(R) + static_cast<std::size_t>(r)] = static_cast<std::uint8_t>(arg);
       }
-      const double s = 100.0 * ovf + util / static_cast<double>(run.size()) + 0.25 * std::abs(r - pref);
-      if (s < best) {
-        best = s;
-        best_l = l;
-      }
+      dp.swap(nd);
     }
-    auto& lu = g.layer_use_vec(best_l);
-    for (std::size_t i : run) {
-      ++lu[edges[i]];
-      layers[i] = static_cast<std::uint8_t>(best_l);
+    int r = 0;
+    for (int q = 1; q < R; ++q)
+      if (dp[static_cast<std::size_t>(q)] < dp[static_cast<std::size_t>(r)]) r = q;
+    for (std::size_t k = len; k-- > 0;) {
+      const int l = ls[static_cast<std::size_t>(r)];
+      ++g.layer_use_vec(l)[edges[run[k]]];
+      layers[run[k]] = static_cast<std::uint8_t>(l);
+      if (k > 0) r = from[k * static_cast<std::size_t>(R) + static_cast<std::size_t>(r)];
     }
   };
   const std::uint32_t rowlen = static_cast<std::uint32_t>(std::max(1, g.nx() - 1));
@@ -634,7 +676,7 @@ std::uint32_t net_vias(const RouteGraph& g, Scratch& sc, std::span<const int> pi
 
 /// Removes the net's edges inside F from the usage (and its route).
 /// Returns the removed edges and their layers (to restore on failure).
-void rip(GlobalRouter::State& s, Id net, const GBox& F, std::vector<std::uint32_t>& removed,
+void rip(GlobalRouter::State& s, Id net, const Region& F, std::vector<std::uint32_t>& removed,
          std::vector<std::uint8_t>& removed_layers) {
   s.save(net);
   const std::size_t i = static_cast<std::size_t>(net);
@@ -642,7 +684,7 @@ void rip(GlobalRouter::State& s, Id net, const GBox& F, std::vector<std::uint32_
   auto& Lv = s.layers[i];
   removed.clear();
   removed_layers.clear();
-  const bool all = F.x0 == 0 && F.y0 == 0 && F.x1 == s.g.nx() - 1 && F.y1 == s.g.ny() - 1;
+  const bool all = F.full(s.g.nx(), s.g.ny());
   std::size_t w = 0;
   auto& use = s.g.use_vec();
   for (std::size_t k = 0; k < E.size(); ++k) {
@@ -724,8 +766,11 @@ BinGrid GlobalRouter::gcell_grid(const Design& design) const {
   double side = design.row_height() > 0 ? opts_.gcell_rows * static_cast<double>(design.row_height())
                                         : std::max(w, h) / 64.0;
   side = std::max(side, 1.0);
+  // At least 16 GCells per side on small dies (but none below one row).
+  const double row = design.row_height() > 0 ? static_cast<double>(design.row_height()) : 1.0;
   auto n = [&](double len) {
-    return static_cast<int>(std::clamp<double>(std::round(len / side), 1.0, std::max(1, opts_.max_grid)));
+    const double lo = std::min(16.0, std::max(1.0, std::floor(len / row)));
+    return static_cast<int>(std::clamp<double>(std::round(len / side), lo, std::max(1, opts_.max_grid)));
   };
   return BinGrid(die, opts_.grid_x > 0 ? opts_.grid_x : n(w), opts_.grid_y > 0 ? opts_.grid_y : n(h));
 }
@@ -789,11 +834,15 @@ void GlobalRouter::estimate_congestion(const Design& design, CongestionMap& map)
 namespace {
 
 struct Scope {
-  GBox window;          // overflow counted on edges inside
-  GBox fence;           // nets change only inside
-  bool all_nets = true; // else nets whose box overlaps the window
+  Region window;        // overflow counted on edges inside
+  Region fence;         // nets change only inside
+  bool all_nets = true; // else nets whose box overlaps the window's box
   bool la = false;      // assign layers inline
   int iterations = 0;
+  /// With a baseline, only edges whose use grew past it count (the repair
+  /// after an incremental reroute fixes the overflow the reroute caused and
+  /// leaves older overflow alone).
+  const std::vector<std::int32_t>* base = nullptr;
 };
 
 struct NegotiateStats {
@@ -802,21 +851,29 @@ struct NegotiateStats {
   bool cancelled = false;
 };
 
-/// Overflow in a window; marks overflowed edges in s.oflag (and returns the
-/// marked list) and, with `hist`, raises their history.
-double scan_overflow(GlobalRouter::State& s, const GBox& w, double hist_inc, std::vector<std::uint32_t>* marked) {
+/// Overflow in a region; marks overflowed edges in s.oflag (and returns the
+/// marked list) and, with hist_inc > 0, raises their history. With `base`,
+/// only edges whose use exceeds base[e] count.
+double scan_overflow(GlobalRouter::State& s, const Region& w, double hist_inc, std::vector<std::uint32_t>* marked,
+                     const std::vector<std::int32_t>* base = nullptr) {
   RouteGraph& g = s.g;
+  if (w.b.empty()) {
+    if (marked) marked->clear();
+    return 0.0;
+  }
   if (s.oflag.size() < g.num_edges()) s.oflag.assign(g.num_edges(), 0);
   auto& hist = g.hist_vec();
-  const std::size_t rows = static_cast<std::size_t>(w.y1 - w.y0 + 1);
-  std::vector<std::vector<std::uint32_t>> parts(rows);
+  const std::size_t rows = static_cast<std::size_t>(w.b.y1 - w.b.y0 + 1);
+  std::vector<std::vector<std::uint32_t>> parts(marked ? rows : 0);
   const double total = par::parallel_sum(0, rows, 4, [&](std::size_t lo, std::size_t hi) {
     double sum = 0.0;
     for (std::size_t r = lo; r < hi; ++r) {
-      const int y = w.y0 + static_cast<int>(r);
+      const int y = w.b.y0 + static_cast<int>(r);
       auto visit = [&](std::uint32_t e) {
         const float o = g.overflow(e);
         if (o <= 0.0f) return;
+        if (base && g.use(e) <= (*base)[e]) return;
+        if (w.mask && !s.edge_in(e, w)) return;
         sum += o;
         if (hist_inc > 0) hist[e] += static_cast<float>(hist_inc * o);
         if (marked) {
@@ -824,9 +881,9 @@ double scan_overflow(GlobalRouter::State& s, const GBox& w, double hist_inc, std
           parts[r].push_back(e);
         }
       };
-      for (int x = w.x0; x < w.x1; ++x) visit(g.h_edge(x, y));
-      if (y < w.y1)
-        for (int x = w.x0; x <= w.x1; ++x) visit(g.v_edge(x, y));
+      for (int x = w.b.x0; x < w.b.x1; ++x) visit(g.h_edge(x, y));
+      if (y < w.b.y1)
+        for (int x = w.b.x0; x <= w.b.x1; ++x) visit(g.v_edge(x, y));
     }
     return sum;
   });
@@ -837,23 +894,25 @@ double scan_overflow(GlobalRouter::State& s, const GBox& w, double hist_inc, std
   return total;
 }
 
-/// Routes `nets` in parallel batches whose windows share no tile.
-/// `work(net, scratch)` reroutes one net. Returns false if cancelled.
+/// Routes `nets` in parallel batches whose windows (everything a net's
+/// reroute may read or write) share no tile. `work(i, scratch)` reroutes
+/// nets[i]. Returns false if cancelled.
 template <class Work>
-bool run_batches(GlobalRouter::State& s, std::span<const Id> nets, const GBox& fence, int margin, RunControl* ctl,
+bool run_batches(GlobalRouter::State& s, std::span<const Id> nets, std::span<const GBox> windows, RunControl* ctl,
                  Work&& work) {
   const RouteGraph& g = s.g;
-  constexpr int kTile = 8;
+  constexpr int kTile = 4;
   const int tx = (g.nx() + kTile - 1) / kTile, ty = (g.ny() + kTile - 1) / kTile;
   std::vector<std::uint64_t> mask(static_cast<std::size_t>(tx) * ty);
-  std::vector<Id> pending(nets.begin(), nets.end()), next;
-  std::vector<std::vector<Id>> batches;
+  std::vector<std::uint32_t> pending(nets.size()), next;
+  std::iota(pending.begin(), pending.end(), 0u);
+  std::vector<std::vector<std::uint32_t>> batches;
   while (!pending.empty()) {
     std::fill(mask.begin(), mask.end(), 0);
-    std::vector<std::vector<Id>> round(64);
+    std::vector<std::vector<std::uint32_t>> round(64);
     next.clear();
-    for (Id n : pending) {
-      const GBox w = s.box[static_cast<std::size_t>(n)].expanded(margin, g.nx(), g.ny()).intersect(fence);
+    for (std::uint32_t n : pending) {
+      const GBox& w = windows[n];
       if (w.empty()) {
         round[0].push_back(n);
         continue;
@@ -876,11 +935,24 @@ bool run_batches(GlobalRouter::State& s, std::span<const Id> nets, const GBox& f
       if (!r.empty()) batches.push_back(std::move(r));
     pending.swap(next);
   }
+  if (HLOG_ENABLED(log_rrr, Debug) && nets.size() > 1) {
+    std::size_t single = 0, largest = 0;
+    for (const auto& b : batches) {
+      single += b.size() == 1;
+      largest = std::max(largest, b.size());
+    }
+    HLOG_DEBUG(log_rrr, "  {} nets in {} parallel batches (largest {}, {} with one net)", nets.size(), batches.size(),
+               largest, single);
+  }
   for (const auto& b : batches) {
     if (ctl && ctl->cancelled()) return false;
-    par::parallel_for(0, b.size(), 8, [&](std::size_t lo, std::size_t hi) {
+    // Trial records are written here, serially: rip() inside the parallel
+    // loop then finds them already saved.
+    if (s.trial)
+      for (std::uint32_t i : b) s.save(nets[i]);
+    par::parallel_for(0, b.size(), 4, [&](std::size_t lo, std::size_t hi) {
       Scratch& sc = scratch(s.g);
-      for (std::size_t i = lo; i < hi; ++i) work(b[i], sc);
+      for (std::size_t k = lo; k < hi; ++k) work(b[k], sc);
     });
   }
   return true;
@@ -889,7 +961,7 @@ bool run_batches(GlobalRouter::State& s, std::span<const Id> nets, const GBox& f
 /// Rip up and reroute one net inside F with the maze; restores it if it
 /// cannot be connected inside F. Returns false then.
 bool reroute_one(GlobalRouter::State& s, const Design& d, const GlobalRouterOptions& o, float pen, Id net,
-                 const GBox& F, bool la, Scratch& sc) {
+                 const Region& F, bool la, Scratch& sc) {
   std::vector<int> pins;
   pin_nodes(d, s.g, net, pins);
   std::vector<std::uint32_t> removed, added;
@@ -922,39 +994,65 @@ NegotiateStats negotiate(GlobalRouter::State& s, const Design& d, const GlobalRo
       break;
     }
     const auto t0 = Clock::now();
-    const double of = scan_overflow(s, sc.window, o.history_increment, &marked);
+    const double of = scan_overflow(s, sc.window, o.history_increment, &marked, sc.base);
     if (of <= 0.0) break;
     if (of < best_of * 0.99) {
       best_of = of;
       stall = 0;
     } else if (o.stall_iterations > 0 && ++stall >= o.stall_iterations) {
       for (std::uint32_t e : marked) s.oflag[e] = 0;
-      HLOG_DEBUG_ID(log_rrr, "GRT-0011", "rrr stopped after {} iterations: overflow {:.4g} (best {:.4g}) stalled", it,
-                    of, best_of);
+      HLOG_DEBUG_ID(log_rrr, "GRT-0011",
+                    "rrr stopped after {} iterations: overflow {:.4g}, not 1% below {:.4g} for {} iterations", it, of,
+                    best_of, stall);
       break;
     }
-    // Nets that use an overflowed edge.
-    std::vector<std::vector<Id>> parts(par::block_count(nn, 4096));
+    // Nets that use an overflowed edge, and the window each is rerouted in:
+    // with local_rrr, the box around its overflowed edges plus rrr_margin
+    // (only that part of the net is ripped up), else its whole box plus the
+    // maze margin. A net that could not be reconnected locally gets its
+    // whole box next time.
+    struct Cand {
+      Id net;
+      GBox w;
+    };
+    if (s.retry_full.size() < nn) s.retry_full.resize(nn, 0);
+    std::vector<std::vector<Cand>> parts(par::block_count(nn, 4096));
     const std::size_t bs = parts.empty() ? 0 : (nn + parts.size() - 1) / parts.size();
     par::parallel_for_each(0, parts.size(), [&](std::size_t b) {
       for (std::size_t n = b * bs; n < std::min(nn, (b + 1) * bs); ++n) {
-        if (!sc.all_nets && !s.box[n].overlaps(sc.window)) continue;
+        if (!sc.all_nets && !s.box[n].overlaps(sc.window.b)) continue;
+        GBox ob;
         for (std::uint32_t e : s.edges[n])
           if (s.oflag[e]) {
-            parts[b].push_back(static_cast<Id>(n));
-            break;
+            const auto [x, y] = s.g.ends(e);
+            ob.add(s.g.node_x(x), s.g.node_y(x));
+            ob.add(s.g.node_x(y), s.g.node_y(y));
+            if (!o.local_rrr) break;
           }
+        if (ob.empty()) continue;
+        const bool whole = !o.local_rrr || s.retry_full[n];
+        const GBox w = whole ? s.box[n].expanded(o.maze_margin, s.g.nx(), s.g.ny())
+                             : ob.expanded(o.rrr_margin, s.g.nx(), s.g.ny());
+        parts[b].push_back({static_cast<Id>(n), w.intersect(sc.fence.b)});
       }
     });
     for (std::uint32_t e : marked) s.oflag[e] = 0;
-    std::vector<Id> cand;
-    for (auto& p : parts) cand.insert(cand.end(), p.begin(), p.end());
-    std::stable_sort(cand.begin(), cand.end(), [&](Id a, Id b) {
-      return s.box[static_cast<std::size_t>(a)].area() > s.box[static_cast<std::size_t>(b)].area();
-    });
+    std::vector<Cand> cs;
+    for (auto& p : parts) cs.insert(cs.end(), p.begin(), p.end());
+    std::stable_sort(cs.begin(), cs.end(), [](const Cand& a, const Cand& b) { return a.w.area() > b.w.area(); });
+    std::vector<Id> cand(cs.size());
+    std::vector<GBox> wins(cs.size());
+    for (std::size_t k = 0; k < cs.size(); ++k) {
+      cand[k] = cs[k].net;
+      wins[k] = cs[k].w;
+    }
     std::atomic<std::size_t> skipped{0};
-    const bool done = run_batches(s, cand, sc.fence, o.maze_margin, ctl, [&](Id n, Scratch& scr) {
-      if (!reroute_one(s, d, o, pen, n, sc.fence, sc.la, scr)) skipped.fetch_add(1, std::memory_order_relaxed);
+    const bool done = run_batches(s, cand, wins, ctl, [&](std::uint32_t k, Scratch& scr) {
+      const Id n = cand[k];
+      const Region F(wins[k], sc.fence.mask, s.g.nx());
+      const bool ok = reroute_one(s, d, o, pen, n, F, sc.la, scr);
+      s.retry_full[static_cast<std::size_t>(n)] = !ok;
+      if (!ok) skipped.fetch_add(1, std::memory_order_relaxed);
     });
     st.ripped += cand.size();
     ++st.iterations;
@@ -1038,7 +1136,7 @@ GlobalRouteResult GlobalRouter::route(const Design& design, RunControl* ctl) {
         sc.next_net();
         const Ctx c{s.g, sc, opts_, pen0};
         auto& E = s.edges[static_cast<std::size_t>(n)];
-        connect_net(c, pins, {}, s.full(), Mode::Pattern, E);
+        connect_net(c, pins, {}, Region(s.full()), Mode::Pattern, E);
         s.layers[static_cast<std::size_t>(n)].assign(E.size(), kNoLayer);
       }
     });
@@ -1058,7 +1156,7 @@ GlobalRouteResult GlobalRouter::route(const Design& design, RunControl* ctl) {
   // Negotiated rip-up and reroute.
   t0 = Clock::now();
   Scope sc;
-  sc.window = sc.fence = s.full();
+  sc.window = sc.fence = Region(s.full(), nullptr, s.g.nx());
   sc.iterations = opts_.max_iterations;
   const NegotiateStats ns = negotiate(s, design, opts_, sc, ctl, 0.1, 0.9, opts_.overflow_penalty);
   res.iterations = ns.iterations;
@@ -1147,7 +1245,7 @@ RerouteResult GlobalRouter::reroute(const Design& design, const RerouteRequest& 
   }
   s.resize_nets(design.num_nets());
   const GBox F = req.fence ? s.gbox(*req.fence).intersect(s.full()) : s.full();
-  const double wl_before = stats().wirelength;  // TODO: per-net deltas if this shows up in profiles
+  double wl_before = 0.0;
 
   // Selected live nets; removed nets are just ripped up.
   std::vector<Id> nets;
@@ -1169,9 +1267,7 @@ RerouteResult GlobalRouter::reroute(const Design& design, const RerouteRequest& 
       nets.push_back(n);
     }
   }
-  // Boxes from the current pins too (pins may have moved), and the repair
-  // window around everything that will change.
-  GBox win;
+  // Boxes from the current pins too (pins may have moved).
   par::parallel_for(0, nets.size(), 256, [&](std::size_t lo, std::size_t hi) {
     std::vector<int> pins;
     for (std::size_t k = lo; k < hi; ++k) {
@@ -1182,16 +1278,45 @@ RerouteResult GlobalRouter::reroute(const Design& design, const RerouteRequest& 
       s.box[static_cast<std::size_t>(n)] = b;
     }
   });
-  for (Id n : nets) win.add(s.box[static_cast<std::size_t>(n)].intersect(F));
-  win = win.expanded(opts_.repair_margin, s.g.nx(), s.g.ny()).intersect(F);
-  if (!win.empty()) res.overflow_before = scan_overflow(s, win, 0.0, nullptr);
+  // Repair region: the union of each net's box plus the repair margin, inside
+  // the fence (a mask, not one bounding box: nets far apart must not make
+  // the whole die the repair window). The bounding box alone is used when
+  // the boxes cover most of it anyway.
+  GBox wb;
+  long long area_sum = 0;
+  for (Id n : nets) {
+    const GBox b = s.box[static_cast<std::size_t>(n)].expanded(opts_.repair_margin, s.g.nx(), s.g.ny()).intersect(F);
+    wb.add(b);
+    area_sum += b.area();
+  }
+  Region win(wb, nullptr, s.g.nx());
+  if (!wb.empty() && area_sum < wb.area() / 2) {
+    s.mask.assign(s.g.num_nodes(), 0);
+    for (Id n : nets) {
+      const GBox b = s.box[static_cast<std::size_t>(n)].expanded(opts_.repair_margin, s.g.nx(), s.g.ny()).intersect(F);
+      for (int y = b.y0; y <= b.y1; ++y)
+        std::fill_n(s.mask.begin() + static_cast<std::ptrdiff_t>(y) * s.g.nx() + b.x0, b.x1 - b.x0 + 1, 1);
+    }
+    win.mask = &s.mask;
+  }
+  const bool repair = req.repair && !wb.empty();
+  if (repair) s.base = s.g.use_vec();  // usage before: the repair fixes only growth
+  if (req.report) {
+    res.overflow_before = scan_overflow(s, win, 0.0, nullptr);
+    wl_before = stats().wirelength;
+  }
 
   // Reroute the selected nets (maze, layers inline).
   if (ctl) ctl->stage_progress(0.0, std::format("reroute {} nets", nets.size()));
   std::atomic<std::size_t> skipped{0};
   const float pen = static_cast<float>(opts_.incremental_penalty);
-  bool ok = run_batches(s, nets, F, opts_.maze_margin, ctl, [&](Id n, Scratch& scr) {
-    if (!reroute_one(s, design, opts_, pen, n, F, opts_.layer_assignment, scr)) skipped.fetch_add(1, std::memory_order_relaxed);
+  const Region Fr(F, nullptr, s.g.nx());
+  std::vector<GBox> wins(nets.size());
+  for (std::size_t k = 0; k < nets.size(); ++k)
+    wins[k] = s.box[static_cast<std::size_t>(nets[k])].expanded(opts_.maze_margin, s.g.nx(), s.g.ny()).intersect(F);
+  bool ok = run_batches(s, nets, wins, ctl, [&](std::uint32_t k, Scratch& scr) {
+    if (!reroute_one(s, design, opts_, pen, nets[k], Fr, opts_.layer_assignment, scr))
+      skipped.fetch_add(1, std::memory_order_relaxed);
   });
   // Pin keys of the nets now routed to their current pins.
   par::parallel_for(0, nets.size(), 256, [&](std::size_t lo, std::size_t hi) {
@@ -1205,35 +1330,39 @@ RerouteResult GlobalRouter::reroute(const Design& design, const RerouteRequest& 
   res.nets_skipped = skipped.load();
   const double t_reroute = since(t0);
 
-  // Repair overflow in the window: only nets with routes there, only their
-  // part inside it.
-  if (ok && req.repair && !win.empty()) {
+  // Repair the overflow the reroute caused in the region: only nets with
+  // routes there, only their part inside it.
+  if (ok && repair) {
     Scope sc;
     sc.window = sc.fence = win;
     sc.all_nets = false;
     sc.la = opts_.layer_assignment;
+    sc.base = &s.base;
     sc.iterations = req.repair_iterations >= 0 ? req.repair_iterations : opts_.repair_iterations;
     const NegotiateStats ns = negotiate(s, design, opts_, sc, ctl, 0.2, 1.0, opts_.incremental_penalty);
     res.iterations = ns.iterations;
     res.nets_repaired = ns.ripped;
     ok = !ns.cancelled;
   }
-  if (!win.empty()) res.overflow_after = scan_overflow(s, win, 0.0, nullptr);
-  const GlobalRouteResult t = stats();
-  res.total_overflow = t.total_overflow;
-  res.wirelength_delta = t.wirelength - wl_before;
+  if (req.report) {
+    res.overflow_after = scan_overflow(s, win, 0.0, nullptr);
+    const GlobalRouteResult t = stats();
+    res.total_overflow = t.total_overflow;
+    res.wirelength_delta = t.wirelength - wl_before;
+  }
   res.cancelled = !ok;
   res.seconds = since(t0);
   HLOG_DEBUG_ID(log_inc, "GRT-0020",
-                "reroute: {} nets ({} kept: not connectable inside the fence) in {:.4f} s; repair window {}x{} GCells, "
-                "{} iterations, {} rip-ups, overflow {:.4g} -> {:.4g}, wirelength {:+.6g}, {:.4f} s total",
-                res.nets_rerouted, res.nets_skipped, t_reroute, win.empty() ? 0 : win.x1 - win.x0 + 1,
-                win.empty() ? 0 : win.y1 - win.y0 + 1, res.iterations, res.nets_repaired, res.overflow_before,
-                res.overflow_after, res.wirelength_delta, res.seconds);
+                "reroute: {} nets ({} kept: not connectable inside the fence) in {:.4f} s; repair region {}x{} GCells "
+                "({}), {} iterations, {} rip-ups, {:.4f} s total",
+                res.nets_rerouted, res.nets_skipped, t_reroute, wb.empty() ? 0 : wb.x1 - wb.x0 + 1,
+                wb.empty() ? 0 : wb.y1 - wb.y0 + 1, win.mask ? "masked" : "box", res.iterations, res.nets_repaired,
+                res.seconds);
   return res;
 }
 
-RerouteResult GlobalRouter::reroute_region(const Design& design, const Rect& area, bool repair, RunControl* ctl) {
+RerouteResult GlobalRouter::reroute_region(const Design& design, const Rect& area, bool repair, RunControl* ctl,
+                                           bool report) {
   State& s = *st_;
   if (!s.routed) return reroute(design, {}, ctl);
   s.resize_nets(design.num_nets());
@@ -1241,6 +1370,7 @@ RerouteResult GlobalRouter::reroute_region(const Design& design, const Rect& are
   RerouteRequest req;
   req.fence = area;
   req.repair = repair;
+  req.report = report;
   const std::size_t nn = design.num_nets();
   std::vector<std::uint8_t> pick(nn, 0);
   par::parallel_for(0, nn, 2048, [&](std::size_t lo, std::size_t hi) {
@@ -1440,7 +1570,7 @@ double GlobalRouter::overflow_in(const Rect& area) const {
   State& s = *st_;
   if (!s.routed) return 0.0;
   const GBox b = s.gbox(area).intersect(s.full());
-  return b.empty() ? 0.0 : scan_overflow(s, b, 0.0, nullptr);
+  return b.empty() ? 0.0 : scan_overflow(s, Region(b), 0.0, nullptr);
 }
 
 void GlobalRouter::net_shapes(const Design& design, Id net, std::vector<WireSegment>& wires,

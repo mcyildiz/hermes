@@ -133,7 +133,13 @@ int main(int argc, char** argv) {
   for (std::size_t n = 0; n < d.num_nets(); ++n)
     if (!d.net(static_cast<Id>(n)).removed && d.net_pins(static_cast<Id>(n)).size() >= 2) live.push_back(static_cast<Id>(n));
   const std::size_t N = live.size();
-  std::vector<std::size_t> scales = {1, 10, 100, 1000, N / 100, N / 10, N / 2};
+  auto ladder = [](std::size_t n) {
+    std::vector<std::size_t> v;
+    for (std::size_t k : {std::size_t{1}, std::size_t{10}, std::size_t{100}, std::size_t{1000}, n / 100, n / 10, n / 2})
+      if (k > 0 && k <= n && (v.empty() || k > v.back())) v.push_back(k);
+    return v;
+  };
+  const std::vector<std::size_t> scales = ladder(N);
 
   // --- Reroute k random nets ---------------------------------------------------
   std::printf("\nreroute k random nets (rip up + A*), then repair; rolled back after each\n");
@@ -147,6 +153,7 @@ int main(int argc, char** argv) {
     RerouteRequest req;
     req.nets = pick;
     req.repair = false;
+    req.report = true;
     r.begin_trial();
     t0 = Clock::now();
     const RerouteResult a = r.reroute(d, req);
@@ -161,7 +168,8 @@ int main(int argc, char** argv) {
     const double ms_b = ms_since(t0);
     r.rollback_trial();
     std::printf("%10zu %12.3f %12.3f %12.2f %12.3f %6.4g->%-7.4g %10.3f\n", k, ms_a, ms_b, 1000.0 * ms_a / k, ms_rb,
-                base.total_overflow, b.total_overflow, 100.0 * b.wirelength_delta / base.wirelength);
+                base.total_overflow, b.total_overflow,
+                base.wirelength > 0 ? 100.0 * b.wirelength_delta / base.wirelength : 0.0);
     (void)a;
   }
 
@@ -176,7 +184,7 @@ int main(int argc, char** argv) {
   std::vector<Id> cells;
   for (Id c = 0; c < static_cast<Id>(d.num_cells()); ++c)
     if (d.cell(c).movable() && !d.cell(c).is_macro) cells.push_back(c);
-  for (std::size_t k : std::vector<std::size_t>{1, 10, 100, 1000, cells.size() / 100, cells.size() / 10}) {
+  for (std::size_t k : ladder(cells.size() / 5)) {
     if (k == 0 || k > cells.size()) continue;
     std::vector<Id> pick = cells;
     std::shuffle(pick.begin(), pick.end(), rng);
@@ -194,6 +202,7 @@ int main(int argc, char** argv) {
     t0 = Clock::now();
     const RerouteResult u = r.update(d);
     const double ms_u = ms_since(t0);
+    const double after_overflow = r.stats().total_overflow;
     t0 = Clock::now();
     r.update(d);
     const double ms_noop = ms_since(t0);
@@ -204,7 +213,7 @@ int main(int argc, char** argv) {
     const double ms_rb = ms_since(t0);
     r.update(d);  // nothing to do after the rollback
     std::printf("%10zu %10zu %12.3f %12.3f %12.3f %6.4g->%-7.4g\n", k, u.nets_rerouted, ms_u, ms_noop, ms_rb,
-                base.total_overflow, u.total_overflow);
+                base.total_overflow, after_overflow);
   }
   {
     // update() without attach: scans every net's pin key.
@@ -224,7 +233,7 @@ int main(int argc, char** argv) {
                     die.xlo + (parts / 2) * w + w / 2, die.ylo + (parts / 2) * h + h / 2};
     r.begin_trial();
     t0 = Clock::now();
-    const RerouteResult a = r.reroute_region(d, area);
+    const RerouteResult a = r.reroute_region(d, area, true, nullptr, true);
     const double ms = ms_since(t0);
     r.rollback_trial();
     std::printf("  1/%-3d of the die side: %8zu nets  %10.3f ms  overflow in region %.4g -> %.4g\n", parts,

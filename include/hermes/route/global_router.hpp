@@ -78,6 +78,12 @@ struct GlobalRouterOptions {
   int initial_rounds = 8;           ///< Pattern-route rounds (each reads the usage of the previous ones).
   int max_iterations = 40;          ///< Rip-up and reroute iterations (full route).
   int maze_margin = 8;              ///< GCells added around a connection's box for the A* search.
+  /// Rip-up and reroute only the part of a net around its overflowed edges
+  /// (their box plus rrr_margin), not the whole net: less work and smaller,
+  /// more parallel batches for big nets. Falls back to the whole net when
+  /// the part cannot be reconnected locally.
+  bool local_rrr = true;
+  int rrr_margin = 6;
   double history_increment = 1.0;   ///< Added per overflowed track per iteration.
   double overflow_penalty = 4.0;    ///< Initial penalty per overflowed track.
   double penalty_growth = 1.5;      ///< Penalty factor per iteration.
@@ -111,12 +117,17 @@ struct GlobalRouteResult {
 };
 
 /// An incremental request. `nets` are ripped up (inside `fence`) and
-/// rerouted; then, with `repair`, overflow near them is resolved.
+/// rerouted; then, with `repair`, the overflow they caused nearby (on edges
+/// whose use grew, within repair_margin GCells of their boxes) is resolved.
+/// Overflow that was there before is left alone.
 struct RerouteRequest {
   std::vector<Id> nets;
   std::optional<Rect> fence;        ///< DBU. Nothing outside it changes.
   bool repair = true;
   int repair_iterations = -1;       ///< -1: options().repair_iterations.
+  /// Fill the RerouteResult overflow and wirelength fields (a scan over all
+  /// edges and nets: costs more than rerouting a few nets).
+  bool report = false;
 };
 
 struct RerouteResult {
@@ -124,7 +135,8 @@ struct RerouteResult {
   std::size_t nets_repaired = 0;    ///< Rip-ups of other nets during repair (a net can count per iteration).
   std::size_t nets_skipped = 0;     ///< Could not be connected inside the fence (kept as they were).
   int iterations = 0;
-  double overflow_before = 0.0;     ///< 2-D overflow in the repair window.
+  // With RerouteRequest::report:
+  double overflow_before = 0.0;     ///< 2-D overflow in the repair region.
   double overflow_after = 0.0;
   double total_overflow = 0.0;      ///< Whole design, after.
   double wirelength_delta = 0.0;    ///< DBU.
@@ -171,7 +183,7 @@ class GlobalRouter {
   /// Reroutes, inside `area`, every net that has a pin in it or a route
   /// through it. Routes outside `area` are untouched.
   RerouteResult reroute_region(const Design& design, const Rect& area, bool repair = true,
-                               RunControl* ctl = nullptr);
+                               RunControl* ctl = nullptr, bool report = false);
   /// Brings the routes up to date with the design: routes new nets, drops
   /// removed ones and reroutes nets whose pin GCells changed (pins that moved
   /// within their GCell cost nothing). Attached (attach()), only the nets the

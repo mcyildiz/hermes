@@ -41,7 +41,8 @@ inline hermes::Design local_design(int cells, double radius_frac, hermes::Dbu pi
   const Dbu side = 1000 * static_cast<Dbu>(std::sqrt(double(cells)) * 4);
   d.set_die({0, 0, side, side});
   d.set_row_height(1000);
-  std::uniform_int_distribution<Dbu> u(0, side - 2000);
+  // Plain modulo instead of std distributions: same design with libstdc++ and libc++.
+  auto u = [&](std::mt19937&) { return static_cast<Dbu>(rng() % static_cast<std::uint32_t>(side - 2000 + 1)); };
   std::vector<Point> loc(cells);
   for (int i = 0; i < cells; ++i) {
     const Id c = d.add_cell("c" + std::to_string(i), 2000, 1000);
@@ -54,14 +55,15 @@ inline hermes::Design local_design(int cells, double radius_frac, hermes::Dbu pi
   auto bk = [&](Point p) { int x = std::min<int>(B - 1, p.x * B / side), y = std::min<int>(B - 1, p.y * B / side); return y * B + x; };
   for (int i = 0; i < cells; ++i) bucket[bk(loc[i])].push_back(i);
   const Dbu R = static_cast<Dbu>(radius_frac * side);
-  std::uniform_int_distribution<int> pc(0, cells - 1), np(2, 5);
+  auto pc = [&](std::mt19937&) { return static_cast<int>(rng() % static_cast<std::uint32_t>(cells)); };
+  auto np = [&](std::mt19937&) { return 2 + static_cast<int>(rng() % 4); };
   for (int n = 0; n < cells; ++n) {
     const Id net = d.add_net("n" + std::to_string(n));
     const int a = pc(rng);
     d.connect(a, net, "Z", {1000, 500}, PinDir::Output);
     const int k = np(rng);
     for (int j = 1; j < k; ++j) {
-      std::uniform_int_distribution<Dbu> off(-R, R);
+      auto off = [&](std::mt19937&) { return static_cast<Dbu>(rng() % static_cast<std::uint32_t>(2 * R + 1)) - R; };
       const Point q{std::clamp<Dbu>(loc[a].x + off(rng), 0, side - 1), std::clamp<Dbu>(loc[a].y + off(rng), 0, side - 1)};
       const auto& b = bucket[bk(q)];
       if (b.empty()) continue;
@@ -161,6 +163,14 @@ std::vector<std::vector<std::uint32_t>> routes(const Design& d, const GlobalRout
   return v;
 }
 
+/// First cell at or after `c` with a pin on a net that has a route.
+Id routed_cell(const Design& d, const GlobalRouter& r, Id c) {
+  for (;; ++c) {
+    for (Id p : d.cell_pins(c))
+      if (d.pin(p).net != kInvalidId && !r.net_edges(d.pin(p).net).empty()) return c;
+  }
+}
+
 // --- Tests -----------------------------------------------------------------------
 
 void test_capacity_snaps_blocked_gcells() {
@@ -208,7 +218,7 @@ void test_full_route_connects_and_is_consistent() {
 }
 
 void test_deterministic_across_threads() {
-  Design d = make(20000, 1300);
+  Design d = make(20000, 1100);
   par::set_num_threads(1);
   GlobalRouter a(opts());
   const GlobalRouteResult ra = a.route(d);
@@ -224,7 +234,7 @@ void test_deterministic_across_threads() {
 
 void test_rip_up_and_reroute_reduces_overflow() {
   // Random placement with coarse pitches: heavily congested.
-  Design d = make(20000, 1300);
+  Design d = make(20000, 1100);
   GlobalRouterOptions o = opts();
   o.max_iterations = 0;
   GlobalRouter pattern(o);
@@ -247,12 +257,14 @@ void test_reroute_nets_changes_only_scope() {
   r.route(d);
   const auto before = routes(d, r);
   // Move one cell far away; reroute its nets without repair: only they change.
-  const Id c = 100;
+  const Id c = routed_cell(d, r, 100);
   d.move_cell(c, {d.die().xhi - 50000, d.die().yhi - 50000});
   d.flush();
   std::vector<Id> nets;
   for (Id p : d.cell_pins(c))
     if (d.pin(p).net != kInvalidId) nets.push_back(d.pin(p).net);
+  std::sort(nets.begin(), nets.end());
+  nets.erase(std::unique(nets.begin(), nets.end()), nets.end());
   RerouteRequest req;
   req.nets = nets;
   req.repair = false;
@@ -272,7 +284,7 @@ void test_reroute_nets_changes_only_scope() {
 }
 
 void test_region_reroute_keeps_outside() {
-  Design d = make(20000, 1300);
+  Design d = make(20000, 1100);
   GlobalRouter r(opts());
   r.route(d);
   const RouteGraph& g = *r.graph();
@@ -293,7 +305,7 @@ void test_region_reroute_keeps_outside() {
                     std::clamp(cell.loc.y + dy, area.ylo, area.yhi - cell.height)});
   }
   d.flush();
-  const RerouteResult res = r.reroute_region(d, area);
+  const RerouteResult res = r.reroute_region(d, area, true, nullptr, true);
   std::fprintf(stderr, "  region reroute: %zu nets, %zu repaired, overflow %.1f -> %.1f, %.4f s\n",
                res.nets_rerouted, res.nets_repaired, res.overflow_before, res.overflow_after, res.seconds);
   CHECK(res.nets_rerouted > 0);
@@ -331,7 +343,7 @@ void test_update_follows_design_changes() {
   r.attach(d);
   r.route(d);
   // A move inside the same GCell: nothing to reroute.
-  const Id c = 200;
+  const Id c = routed_cell(d, r, 200);
   d.move_cell(c, d.cell(c).loc + Point{1, 0});
   d.flush();
   RerouteResult u = r.update(d);
@@ -360,7 +372,8 @@ void test_update_follows_design_changes() {
   // Without attach (no tracking), update() finds the changes by pin key.
   GlobalRouter r2(opts());
   r2.route(d);
-  d.move_cell(300, {d.die().xhi - 30000, d.die().ylo + 1000});
+  const Id mc = routed_cell(d, r2, 300);
+  d.move_cell(mc, {d.die().xhi - 30000, d.die().ylo + 1000});
   d.flush();
   u = r2.update(d);
   CHECK(u.nets_rerouted > 0);

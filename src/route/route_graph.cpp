@@ -1,6 +1,7 @@
 #include "hermes/route/route_graph.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 #include "hermes/par/parallel.hpp"
 
@@ -39,7 +40,9 @@ RouteGraph::RouteGraph(const Design& d, const BinGrid& grid, const RouteUsageOpt
         const bool h = e < nh_;
         if ((h && !in_h) || (!h && !in_v)) continue;
         const auto [a, b] = ends(static_cast<std::uint32_t>(e));
-        lc[e] = std::min(gc[static_cast<std::size_t>(a)], gc[static_cast<std::size_t>(b)]);
+        // Whole tracks: a layer holds an integer number of wires, so the 2-D
+        // capacity (their sum) is what layer assignment can actually reach.
+        lc[e] = std::floor(std::min(gc[static_cast<std::size_t>(a)], gc[static_cast<std::size_t>(b)]) + 1e-3f);
       }
     });
   }

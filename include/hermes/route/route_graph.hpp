@@ -8,8 +8,9 @@
 //   horizontal edge (x, y) -- (x + 1, y): id y * (nx - 1) + x          (x < nx - 1)
 //   vertical   edge (x, y) -- (x, y + 1): id H + y * nx + x            (y < ny - 1)
 // with H = (nx - 1) * ny. Edge capacity on a layer is the smaller of the two
-// GCells' track capacities on that layer (layer_capacity()), so a route with
-// no edge overflow also has no GCell overflow in the QoR track model. The
+// GCells' track capacities on that layer (layer_capacity()), rounded down to
+// whole tracks, so a route with no edge overflow also has no GCell overflow
+// in the QoR track model. The
 // 2-D capacity of an edge is the sum over the layers of its direction.
 //
 // Usage is in tracks (integers), one per net per edge.

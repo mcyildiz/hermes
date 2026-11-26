@@ -84,7 +84,21 @@ struct RouteUsage3D {
   std::uint64_t total_vias() const;
 };
 
-/// Routes every net as the global router does today (star from the driver,
+/// The GCell grid of the 3-D usage: the design's route grid (Bookshelf
+/// .route tiles) when present and allowed, else grid_x * grid_y over the die.
+BinGrid route_gcell_grid(const Design& d, const RouteUsageOptions& o = {});
+
+/// Capacity in tracks per [layer][gcell] on `grid`: tracks of the layer's
+/// direction crossing the GCell, reduced by blockages (route-file blockages,
+/// else macros on the lowest layers). GCells blocked to within 1e-4 of fully
+/// get exactly 0 (no near-zero capacities that blow up utilization). The
+/// global router and build_route_usage() share it, so routed and estimated
+/// usage have the same capacities.
+std::vector<std::vector<float>> layer_capacity(const Design& d, const LayerStack& stack, const BinGrid& grid,
+                                               const RouteUsageOptions& o = {});
+
+/// Estimated usage without a router (used by the QoR report when no routed
+/// usage is given). Routes every net as the old stub router did (star from the driver,
 /// horizontal-then-vertical L per sink) and assigns each horizontal and
 /// vertical run to a layer of that direction by its length in GCells (log4
 /// tiers: < 3 GCells on the lowest layer, 3-14 the next, ...). Pins are on

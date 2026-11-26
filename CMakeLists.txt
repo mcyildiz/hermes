@@ -59,6 +59,7 @@ add_library(hermes_core
   src/route/detailed_router.cpp
   src/route/route_usage.cpp
   src/route/route_shapes.cpp
+  src/route/route_graph.cpp
   src/qor/qor.cpp
   src/track/run_tracker.cpp
   src/track/http_post.cpp
@@ -304,6 +305,10 @@ if(HERMES_BUILD_TESTS)
   endif()
   add_test(NAME hermes_qor_tests COMMAND hermes_qor_tests)
 
+  add_executable(hermes_route_tests tests/test_route.cpp)
+  target_link_libraries(hermes_route_tests PRIVATE hermes::core)
+  add_test(NAME hermes_route_tests COMMAND hermes_route_tests)
+
   add_executable(hermes_gui_tests tests/test_gui.cpp)
   target_link_libraries(hermes_gui_tests PRIVATE hermes_gui_scene)
   add_test(NAME hermes_gui_tests COMMAND hermes_gui_tests)
@@ -340,4 +345,6 @@ if(HERMES_BUILD_BENCH)
   target_link_libraries(hermes_gui_bench PRIVATE hermes_gui_scene)
   add_executable(hermes_qor_bench bench/qor_bench.cpp)
   target_link_libraries(hermes_qor_bench PRIVATE hermes::core)
+  add_executable(hermes_route_bench bench/route_bench.cpp)
+  target_link_libraries(hermes_route_bench PRIVATE hermes::core)
 endif()

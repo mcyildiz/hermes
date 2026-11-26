@@ -24,6 +24,7 @@ class CongestionMap {
   void add_demand(int ix, int iy, double d) { demand_[index(ix, iy)] += d; }
   void set_capacity(int ix, int iy, double c) { capacity_[index(ix, iy)] = c; }
   void clear_demand();
+  void scale_demand(double f);
 
   /// demand / capacity for one bin.
   double utilization(int ix, int iy) const;

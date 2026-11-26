@@ -252,8 +252,9 @@ void test_flow_report_has_qor() {
   CHECK(!r.stage_seconds.empty() && r.stage_seconds.back().first == "report");
   const std::string text = format_qor(r.qor);
   CHECK(text.find("Placement density") != std::string::npos);
-  CHECK(text.find("ESTIMATES") != std::string::npos);
-  CHECK(text.find("2-D numbers in the log disagree") != std::string::npos);
+  // Routed by the real router: layers are assigned, not estimated.
+  CHECK(text.find("ESTIMATES") == std::string::npos);
+  CHECK(text.find("router's 2-D edge overflow") != std::string::npos);
   const std::string maps = qor_maps_to_json(r.qor, 8);
   CHECK(maps.find("\"nx\":8") != std::string::npos);
 

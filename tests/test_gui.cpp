@@ -59,6 +59,9 @@ std::shared_ptr<const DesignSnapshot> snap_of(Design& d) {
 void test_estimated_routes_match_route_usage() {
   Design d = small(4000);
   RouteUsageOptions ro;
+  const BinGrid rg = GlobalRouter().gcell_grid(d);  // make_tech_info uses the router's grid
+  ro.grid_x = rg.nx();
+  ro.grid_y = rg.ny();
   const RouteUsage3D u = build_route_usage(d, ro);
   auto tech = make_tech_info(d);
   std::vector<double> wl(static_cast<std::size_t>(u.num_layers()), 0.0);

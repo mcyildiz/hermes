@@ -35,15 +35,8 @@ std::shared_ptr<TechInfo> make_tech_info(const Design& d, const GlobalRouterOpti
   o.first_routing_layer = router.first_routing_layer;
   o.macro_blocked_layers = router.macro_blocked_layers;
   LayerStack st = layer_stack_for(d, o);
-  // Same GCell grid as build_route_usage().
-  BinGrid g;
-  const RouteGrid& rg = d.route_grid();
-  if (!rg.empty() && o.use_route_grid) {
-    g = BinGrid({rg.origin.x, rg.origin.y, rg.origin.x + rg.nx * rg.tile_w, rg.origin.y + rg.ny * rg.tile_h}, rg.nx,
-                rg.ny);
-  } else {
-    g = BinGrid(d.die(), std::max(1, o.grid_x), std::max(1, o.grid_y));
-  }
+  // Same GCell grid as the global router.
+  const BinGrid g = GlobalRouter(router).gcell_grid(d);
   auto t = std::make_shared<TechInfo>();
   t->wires_source = "Estimated: global router stub (star + L-shape), greedy layer assignment; layers from " + st.source;
   t->routes = EstimatedRouteModel(std::move(st), g);

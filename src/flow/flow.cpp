@@ -52,7 +52,8 @@ FlowReport run_flow(Design& design, const FlowOptions& opts, RunControl* ctl) {
       const auto tq = std::chrono::steady_clock::now();
       QorOptions qo = opts.qor;
       qo.target_density = opts.placer.target_density;
-      rep.qor = compute_qor(design, qo, nullptr, opts.router.grid_x, opts.router.grid_y);
+      const BinGrid gg = groute.gcell_grid(design);
+      rep.qor = compute_qor(design, qo, nullptr, gg.nx(), gg.ny());
       rep.has_qor = true;
       rep.stage_seconds.emplace_back("report", seconds_since(tq));
     }
@@ -63,7 +64,7 @@ FlowReport run_flow(Design& design, const FlowOptions& opts, RunControl* ctl) {
   // Routing.
   if (ctl) ctl->begin_stage("global route", 0.85, 0.95);
   CongestionMap map = groute.make_map(design);
-  rep.global_route = groute.route(design, map);
+  rep.global_route = groute.route(design, map, ctl);
   // The router's 3-D result (layer usage, vias) for the report.
   RouteUsage3D usage;
   double usage_s = 0.0;
@@ -73,7 +74,7 @@ FlowReport run_flow(Design& design, const FlowOptions& opts, RunControl* ctl) {
     usage_s = seconds_since(tu);
   }
   rep.stage_seconds.emplace_back("global route", seconds_since(t0));
-  if (ctl && ctl->cancelled()) {
+  if (rep.global_route.cancelled || (ctl && ctl->cancelled())) {
     rep.cancelled = true;
     return rep;
   }
@@ -106,11 +107,8 @@ FlowReport run_flow(Design& design, const FlowOptions& opts, RunControl* ctl) {
     rep.qor.seconds.insert(rep.qor.seconds.begin(), {"route usage", usage_s});
     rep.qor.total_seconds += usage_s;
     rep.qor.notes.push_back(std::format(
-        "The 2-D numbers in the log disagree: placement 'routing overflow' {:.4g} (RUDY) vs global route "
-        "overflow {:.4g}. Both use the old 2-D map (capacity 2*(w+h) of wire per GCell, 80% lost under macros), "
-        "but RUDY spreads each net's HPWL over its bounding box while the router adds one whole GCell length per "
-        "GCell its L path crosses and nothing for wire inside one GCell, so the two are not comparable. The 3-D track model above is the one to use; the placer and router move to "
-        "it with the real router (step 8).",
+        "Placement 'routing overflow' {:.4g} is the RUDY estimate on the router's GCell grid in tracks; global "
+        "route overflow {:.4g} is the router's 2-D edge overflow (tracks) after rip-up and reroute.",
         rep.placement.overflow, rep.global_route.total_overflow));
     rep.has_qor = true;
     rep.stage_seconds.emplace_back("report", seconds_since(tq));

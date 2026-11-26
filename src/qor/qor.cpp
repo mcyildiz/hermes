@@ -555,11 +555,11 @@ QorReport compute_qor(const Design& d, const QorOptions& o, const RouteUsage3D* 
   // Notes: what is measured and what is estimated.
   if (u->layers_estimated) {
     q.notes.push_back(
-        "Per-layer wirelength, per-layer congestion and via counts are ESTIMATES: the global router "
-        "is still a stub (star + L-shape, no rip-up, no layer assignment); a greedy length-based layer "
-        "assignment is applied for this report. Total routed length is the router's real L-shape length.");
+        "Per-layer wirelength, per-layer congestion and via counts are ESTIMATES: no routed layer assignment "
+        "is available (no global route in this run, or layer assignment off), so a greedy length-based layer "
+        "assignment of star + L-shape routes is used for this report.");
   }
-  if (!c.routed) q.notes.push_back("No routing in this run: congestion uses the router's L-shapes computed for this report.");
+  if (!c.routed) q.notes.push_back("No routing in this run: congestion uses star + L-shape routes computed for this report.");
   if (u->stack.source.rfind("default", 0) == 0) {
     q.notes.push_back(std::format(
         "The input has no routing-layer data (no technology LEF, no .route file): an assumed 6-layer "

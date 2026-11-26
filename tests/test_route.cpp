@@ -15,6 +15,7 @@
 #include "hermes/log/log.hpp"
 #include "hermes/par/job.hpp"
 #include "hermes/par/parallel.hpp"
+#include "hermes/place/placer.hpp"
 #include "hermes/qor/qor.hpp"
 #include "hermes/route/global_router.hpp"
 
@@ -467,6 +468,29 @@ void test_placer_map_in_tracks() {
   CHECK(dr > 0.3 * de && dr < 3.0 * de);
 }
 
+void test_routability_feedback_on_track_map() {
+  // The placer's routability feedback with the default (track) map: a
+  // congested design gets cells inflated where utilization exceeds 1.
+  Design d = make(4000, 1800);
+  GlobalRouter r(opts());
+  CongestionMap m = r.make_map(d);
+  r.estimate_congestion(d, m);
+  CHECK(m.max_utilization() > 1.0);
+  PlacerOptions po;
+  po.max_iterations = 40;
+  po.timing_interval = 0;
+  po.routability_interval = 5;
+  po.routability_start_overflow = 1.0;
+  po.stop_overflow = 0.0;
+  po.legalize = false;
+  po.detailed_placement = false;
+  po.keep_placed = true;
+  MixedSizePlacer placer(po);
+  placer.run(d, nullptr, &r);
+  const auto& infl = placer.inflation();
+  CHECK(std::count_if(infl.begin(), infl.end(), [](double f) { return f > 1.0; }) > 0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -486,6 +510,7 @@ int main(int argc, char** argv) {
       {"cancel_leaves_consistent_state", test_cancel_leaves_consistent_state},
       {"route_usage_matches_stats", test_route_usage_matches_stats},
       {"placer_map_in_tracks", test_placer_map_in_tracks},
+      {"routability_feedback_on_track_map", test_routability_feedback_on_track_map},
   };
   const char* only = argc > 1 ? argv[1] : nullptr;
   for (const auto& t : tests) {

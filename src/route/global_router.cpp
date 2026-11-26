@@ -207,6 +207,7 @@ struct GlobalRouter::State {
   std::vector<GBox> box;
   std::vector<std::uint32_t> vias;
   std::uint64_t macro_key = 0;
+  float penalty = 4.0f;  // where the last full route's negotiation ended
   std::vector<std::uint8_t> oflag;  // scratch: overflowed edge in the current window
   std::vector<std::uint8_t> mask;   // scratch: repair region GCells
   std::vector<std::int32_t> base;   // scratch: edge use before an incremental reroute
@@ -224,7 +225,7 @@ struct GlobalRouter::State {
   State() { listener.s = this; }
   State(const State& o)
       : g(o.g), routed(o.routed), edges(o.edges), layers(o.layers), key(o.key), box(o.box), vias(o.vias),
-        macro_key(o.macro_key) {
+        macro_key(o.macro_key), penalty(o.penalty) {
     listener.s = this;
   }
   ~State() {
@@ -846,6 +847,7 @@ struct Scope {
 };
 
 struct NegotiateStats {
+  float final_penalty = 0.0f;
   int iterations = 0;
   std::size_t ripped = 0;
   bool cancelled = false;
@@ -1016,11 +1018,32 @@ NegotiateStats negotiate(GlobalRouter::State& s, const Design& d, const GlobalRo
       GBox w;
     };
     if (s.retry_full.size() < nn) s.retry_full.resize(nn, 0);
+    // Summed-area table of overflowed edges per 4x4-GCell tile: a net whose
+    // box holds none is skipped without walking its edges.
+    constexpr int kT = 4;
+    const int tx = (s.g.nx() + kT - 1) / kT, ty = (s.g.ny() + kT - 1) / kT;
+    std::vector<std::uint32_t> sat(static_cast<std::size_t>(tx + 1) * (ty + 1), 0);
+    for (std::uint32_t e : marked) {
+      const int a = s.g.ends(e).first;
+      ++sat[static_cast<std::size_t>(s.g.node_y(a) / kT + 1) * (tx + 1) + s.g.node_x(a) / kT + 1];
+    }
+    for (int y = 1; y <= ty; ++y)
+      for (int x = 1; x <= tx; ++x) {
+        const std::size_t i = static_cast<std::size_t>(y) * (tx + 1) + x;
+        sat[i] += sat[i - 1] + sat[i - static_cast<std::size_t>(tx + 1)] - sat[i - static_cast<std::size_t>(tx + 1) - 1];
+      }
+    auto any_marked = [&](const GBox& b) {
+      // An edge's lower end lies in [x0-1, x1] x [y0-1, y1] if the edge touches b.
+      const int x0 = std::max(0, b.x0 - 1) / kT, y0 = std::max(0, b.y0 - 1) / kT;
+      const int x1 = b.x1 / kT + 1, y1 = b.y1 / kT + 1;
+      auto at = [&](int x, int y) { return sat[static_cast<std::size_t>(y) * (tx + 1) + x]; };
+      return at(x1, y1) - at(x0, y1) - at(x1, y0) + at(x0, y0) > 0;
+    };
     std::vector<std::vector<Cand>> parts(par::block_count(nn, 4096));
     const std::size_t bs = parts.empty() ? 0 : (nn + parts.size() - 1) / parts.size();
     par::parallel_for_each(0, parts.size(), [&](std::size_t b) {
       for (std::size_t n = b * bs; n < std::min(nn, (b + 1) * bs); ++n) {
-        if (!sc.all_nets && !s.box[n].overlaps(sc.window.b)) continue;
+        if (s.edges[n].empty() || !any_marked(s.box[n])) continue;
         GBox ob;
         for (std::uint32_t e : s.edges[n])
           if (s.oflag[e]) {
@@ -1067,6 +1090,7 @@ NegotiateStats negotiate(GlobalRouter::State& s, const Design& d, const GlobalRo
     }
     pen = std::min(static_cast<float>(o.max_penalty), pen * static_cast<float>(o.penalty_growth));
   }
+  st.final_penalty = pen;
   return st;
 }
 
@@ -1160,6 +1184,7 @@ GlobalRouteResult GlobalRouter::route(const Design& design, RunControl* ctl) {
   sc.iterations = opts_.max_iterations;
   const NegotiateStats ns = negotiate(s, design, opts_, sc, ctl, 0.1, 0.9, opts_.overflow_penalty);
   res.iterations = ns.iterations;
+  s.penalty = std::max(static_cast<float>(opts_.overflow_penalty), ns.final_penalty);
   res.cancelled = ns.cancelled || (ctl && ctl->cancelled());
   res.seconds.emplace_back("rip-up and reroute", since(t0));
 
@@ -1309,7 +1334,7 @@ RerouteResult GlobalRouter::reroute(const Design& design, const RerouteRequest& 
   // Reroute the selected nets (maze, layers inline).
   if (ctl) ctl->stage_progress(0.0, std::format("reroute {} nets", nets.size()));
   std::atomic<std::size_t> skipped{0};
-  const float pen = static_cast<float>(opts_.incremental_penalty);
+  const float pen = opts_.incremental_penalty > 0 ? static_cast<float>(opts_.incremental_penalty) : s.penalty;
   const Region Fr(F, nullptr, s.g.nx());
   std::vector<GBox> wins(nets.size());
   for (std::size_t k = 0; k < nets.size(); ++k)
@@ -1339,7 +1364,7 @@ RerouteResult GlobalRouter::reroute(const Design& design, const RerouteRequest& 
     sc.la = opts_.layer_assignment;
     sc.base = &s.base;
     sc.iterations = req.repair_iterations >= 0 ? req.repair_iterations : opts_.repair_iterations;
-    const NegotiateStats ns = negotiate(s, design, opts_, sc, ctl, 0.2, 1.0, opts_.incremental_penalty);
+    const NegotiateStats ns = negotiate(s, design, opts_, sc, ctl, 0.2, 1.0, pen);
     res.iterations = ns.iterations;
     res.nets_repaired = ns.ripped;
     ok = !ns.cancelled;
@@ -1450,8 +1475,6 @@ RerouteResult GlobalRouter::update(const Design& design, RunControl* ctl) {
     RerouteRequest req;
     req.nets = std::move(cand);
     res = reroute(design, req, ctl);
-  } else {
-    res.total_overflow = stats().total_overflow;
   }
   res.seconds = since(t0);
   HLOG_DEBUG_ID(log_inc, "GRT-0023", "update: checked {} nets, {} changed GCells, {:.4f} s", checked,

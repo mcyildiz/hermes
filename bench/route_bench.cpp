@@ -3,6 +3,8 @@
 //
 //   ./build/hermes_route_bench <input> [--place] [--save placed.hdb]
 //                              [--gcell-rows R] [--threads 1,4,0] [--seed S]
+//                              [--inc-penalty P]   (0 = the full route's final penalty)
+//                              [--repair-iters N] [--skip-sweep]
 //
 // <input> is anything hermes reads (Bookshelf dir/.aux, LEF/DEF dir, .hdb).
 // Without a placement in the input (or with --place) it runs the placer
@@ -54,16 +56,21 @@ int main(int argc, char** argv) {
   }
   log::set_level("", log::Level::Warn);
   std::string input = argv[1], save;
-  bool place = false;
+  bool place = false, skip_sweep = false;
   double gcell_rows = 6.0;
   std::vector<int> threads = {1, 4, 0};
   unsigned seed = 5;
+  double inc_penalty = -1.0;
+  int repair_iters = -1;
   for (int i = 2; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--place")) place = true;
     else if (!std::strcmp(argv[i], "--save") && i + 1 < argc) save = argv[++i];
     else if (!std::strcmp(argv[i], "--gcell-rows") && i + 1 < argc) gcell_rows = std::atof(argv[++i]);
     else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) threads = parse_list(argv[++i]);
     else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) seed = static_cast<unsigned>(std::atoi(argv[++i]));
+    else if (!std::strcmp(argv[i], "--inc-penalty") && i + 1 < argc) inc_penalty = std::atof(argv[++i]);
+    else if (!std::strcmp(argv[i], "--repair-iters") && i + 1 < argc) repair_iters = std::atoi(argv[++i]);
+    else if (!std::strcmp(argv[i], "--skip-sweep")) skip_sweep = true;
   }
   auto t0 = Clock::now();
   Design d = io::is_design_file(input) ? io::load_design(input) : io::load_input(input);
@@ -91,6 +98,8 @@ int main(int argc, char** argv) {
 
   GlobalRouterOptions ro;
   ro.gcell_rows = gcell_rows;
+  if (inc_penalty >= 0) ro.incremental_penalty = inc_penalty;
+  if (repair_iters >= 0) ro.repair_iterations = repair_iters;
 
   // --- Full route: threads -------------------------------------------------------
   std::printf("full route, %.1f rows per GCell\n", gcell_rows);
@@ -115,7 +124,7 @@ int main(int argc, char** argv) {
   }
   // GCell size sweep at the last thread count.
   std::printf("\nGCell size (threads %d)\n", par::num_threads());
-  for (double rows : {3.0, 4.0, 6.0, 10.0}) {
+  for (double rows : skip_sweep ? std::vector<double>{} : std::vector<double>{3.0, 4.0, 6.0, 10.0}) {
     GlobalRouterOptions o = ro;
     o.gcell_rows = rows;
     GlobalRouter r(o);
@@ -152,8 +161,7 @@ int main(int argc, char** argv) {
     pick.resize(k);
     RerouteRequest req;
     req.nets = pick;
-    req.repair = false;
-    req.report = true;
+    req.repair = false;  // timed without report: totals are measured outside
     r.begin_trial();
     t0 = Clock::now();
     const RerouteResult a = r.reroute(d, req);
@@ -164,12 +172,13 @@ int main(int argc, char** argv) {
     req.repair = true;
     r.begin_trial();
     t0 = Clock::now();
-    const RerouteResult b = r.reroute(d, req);
+    r.reroute(d, req);
     const double ms_b = ms_since(t0);
+    const GlobalRouteResult after = r.stats();
     r.rollback_trial();
     std::printf("%10zu %12.3f %12.3f %12.2f %12.3f %6.4g->%-7.4g %10.3f\n", k, ms_a, ms_b, 1000.0 * ms_a / k, ms_rb,
-                base.total_overflow, b.total_overflow,
-                base.wirelength > 0 ? 100.0 * b.wirelength_delta / base.wirelength : 0.0);
+                base.total_overflow, after.total_overflow,
+                base.wirelength > 0 ? 100.0 * (after.wirelength - base.wirelength) / base.wirelength : 0.0);
     (void)a;
   }
 

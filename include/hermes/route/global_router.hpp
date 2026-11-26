@@ -98,9 +98,11 @@ struct GlobalRouterOptions {
   // --- Incremental ------------------------------------------------------------
   int repair_margin = 4;            ///< GCells around rerouted nets searched for overflow to repair.
   int repair_iterations = 8;
-  /// Initial overflow penalty for incremental reroutes and their repair.
-  /// (Starting high, e.g. 50, detoured more and repaired worse in tests.)
-  double incremental_penalty = 4.0;
+  /// Overflow penalty for incremental reroutes and their repair. 0 = where
+  /// the last full route's negotiation ended (the other nets have settled
+  /// under it; on a congested 250k-net design this gave less overflow and
+  /// wirelength than restarting at overflow_penalty).
+  double incremental_penalty = 0.0;
 };
 
 struct GlobalRouteResult {

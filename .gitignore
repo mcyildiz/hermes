@@ -1,0 +1,8 @@
+build*/
+__pycache__/
+*.pyc
+.pytest_cache/
+python/hermes/*.so
+*.egg-info/
+.DS_Store
+*.whl

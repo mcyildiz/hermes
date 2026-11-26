@@ -1,0 +1,56 @@
+# Small hand-written design for the LEF/DEF reader tests.
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN sample ;
+UNITS DISTANCE MICRONS 2000 ;
+
+PROPERTYDEFINITIONS
+  COMPONENTPIN designRuleWidth REAL ;
+END PROPERTYDEFINITIONS
+
+DIEAREA ( 0 0 ) ( 200000 0 ) ( 200000 160000 ) ( 0 160000 ) ;
+
+ROW ROW_0 core 0 0 N DO 1000 BY 1 STEP 400 0 ;
+ROW ROW_1 core 0 4000 FS DO 1000 BY 1 STEP 400 0 ;
+ROW ROW_2 core 0 8000 N DO 1000 BY 1 STEP 400 0 ;
+
+TRACKS X 200 DO 500 STEP 400 LAYER metal2 ;
+GCELLGRID X 0 DO 11 STEP 20000 ;
+
+VIAS 1 ;
+  - via12_gen + RECT metal1 ( -100 -100 ) ( 100 100 ) ;
+END VIAS
+
+COMPONENTS 5 ;
+  - u1 INV + PLACED ( 1000 4000 ) N ;
+  - u2 INV + SOURCE NETLIST + PLACED ( 2000 4000 ) FS + WEIGHT 2 ;
+  - u3 NAND2 + UNPLACED ;
+  - u4 INV + FIXED ( 10000 0 ) E ;
+  - ram0 RAM + FIXED ( 40000 40000 ) W + HALO 100 100 100 100 ;
+END COMPONENTS
+
+PINS 2 ;
+  - in1 + NET n_in + DIRECTION INPUT + USE SIGNAL
+    + LAYER metal2 ( -100 0 ) ( 100 400 )
+    + PLACED ( 0 80000 ) E ;
+  - out1 + NET n_out + DIRECTION OUTPUT + USE SIGNAL
+    + LAYER metal2 ( -100 0 ) ( 100 400 )
+    + FIXED ( 200000 80000 ) W ;
+END PINS
+
+SPECIALNETS 1 ;
+  - VDD ( * VDD ) + USE POWER
+    + ROUTED metal1 400 ( 0 4000 ) ( 200000 * ) ;
+END SPECIALNETS
+
+NETS 4 ;
+  - n_in ( PIN in1 ) ( u1 A ) ;
+  - n1 ( u1 Z ) ( u2 A ) ( u3 A )
+    + ROUTED metal1 ( 900 5000 ) ( 2200 * ) via12_gen
+      NEW metal2 ( 2200 5000 ) ( * 6000 ) ;
+  - n2 ( u2 Z ) ( u3 B ) ( ram0 D ) + USE SIGNAL ;
+  - n_out ( ram0 Q ) ( u4 A ) ( PIN out1 ) ;
+END NETS
+
+END DESIGN

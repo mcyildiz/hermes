@@ -1,0 +1,20 @@
+[build-system]
+requires = ["scikit-build-core>=0.9", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "hermes-pnr"
+version = "0.1.0"
+description = "Holistic Engine for Routability-driven Mixed-size placement with Embedded STA"
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.scikit-build]
+wheel.packages = ["python/hermes"]
+cmake.define = { HERMES_BUILD_TESTS = "OFF", HERMES_BUILD_APPS = "OFF" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

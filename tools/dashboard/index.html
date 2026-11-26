@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hermes runs</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1b1f24; --muted: #66707a; --line: #e3e6ea;
+  --accent: #2f6fde; --ok: #1f9d55; --warn: #c98a00; --bad: #d2463c; --run: #2f6fde; --chip: #eef1f5;
+  --c1: #2f6fde; --c2: #e0742b; --c3: #2a9d8f; --c4: #9b59b6; --c5: #c0392b; --c6: #7f8c8d;
+  font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121418; --panel: #1a1d23; --ink: #e6e9ee; --muted: #959ea8; --line: #2a2f37;
+    --accent: #6c9cff; --ok: #3ccf7a; --warn: #e8b43a; --bad: #ff6b5e; --run: #6c9cff; --chip: #242830;
+    --c1: #6c9cff; --c2: #ff9a52; --c3: #4fd1c0; --c4: #c08cff; --c5: #ff6b5e; --c6: #aab4be;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); }
+header { display: flex; align-items: center; gap: 16px; padding: 10px 20px; background: var(--panel);
+  border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; flex-wrap: wrap; }
+header .logo { font-weight: 700; letter-spacing: .04em; }
+header a { color: var(--ink); text-decoration: none; }
+header nav a { margin-right: 12px; color: var(--muted); }
+header nav a.on { color: var(--ink); font-weight: 600; }
+header input { flex: 1; min-width: 160px; max-width: 360px; padding: 6px 10px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--bg); color: var(--ink); }
+.live { color: var(--muted); font-size: 12px; margin-left: auto; }
+.live b { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); margin-right: 6px; }
+main { padding: 16px 20px 40px; max-width: 1400px; margin: 0 auto; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
+.panel h2 { font-size: 15px; margin: 0 0 10px; }
+.grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tr.click { cursor: pointer; }
+tr.click:hover td { background: var(--chip); }
+.scroll { overflow-x: auto; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; background: var(--chip); }
+.pill.done { color: var(--ok); } .pill.running { color: var(--run); } .pill.failed, .pill.lost, .pill.aborted { color: var(--bad); }
+.pill.cancelled { color: var(--warn); }
+.bar { height: 6px; background: var(--chip); border-radius: 3px; overflow: hidden; min-width: 80px; }
+.bar > i { display: block; height: 100%; background: var(--run); }
+.muted { color: var(--muted); }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; }
+.kv div:nth-child(odd) { color: var(--muted); }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+canvas { width: 100%; display: block; }
+.timeline { display: flex; height: 26px; border-radius: 6px; overflow: hidden; margin: 6px 0 10px; }
+.timeline div { color: #fff; font-size: 11px; padding: 5px 6px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.log { max-height: 360px; overflow: auto; }
+.log td { white-space: pre-wrap; padding: 2px 8px; }
+.lv-error { color: var(--bad); } .lv-warn { color: var(--warn); } .lv-info { } .lv-verbose, .lv-debug { color: var(--muted); }
+.better { color: var(--ok); } .worse { color: var(--bad); }
+select, button { background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.notes li { margin-bottom: 6px; color: var(--muted); }
+.legend span { margin-right: 14px; font-size: 12px; }
+.legend i { display: inline-block; width: 10px; height: 3px; margin-right: 5px; vertical-align: middle; }
+.tip { position: fixed; pointer-events: none; background: var(--panel); border: 1px solid var(--line); padding: 4px 8px;
+  border-radius: 6px; font-size: 12px; display: none; z-index: 10; }
+.empty { padding: 30px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <a class="logo" href="#/">hermes</a>
+  <nav><a href="#/" id="nav-runs">Runs</a><a href="#/compare/" id="nav-cmp">Compare</a></nav>
+  <input id="q" placeholder="filter: design, name, host, tag, id" autocomplete="off">
+  <span class="live" id="live"><b></b>live</span>
+</header>
+<main id="main"></main>
+<div class="tip" id="tip"></div>
+<script>
+"use strict";
+const $ = (s, e = document) => e.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const COLORS = ["--c1","--c2","--c3","--c4","--c5","--c6"];
+const selected = new Set(JSON.parse(localStorageGet("hermes.sel") || "[]"));
+let timer = null;
+
+function localStorageGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function localStorageSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+async function api(path) {
+  const r = await fetch(path, {credentials: "same-origin"});
+  if (!r.ok) throw new Error(path + ": " + r.status);
+  return r.json();
+}
+function fmt(v, d = 4) {
+  if (v === null || v === undefined || v === "") return "";
+  if (typeof v !== "number") return esc(v);
+  if (!isFinite(v)) return "";
+  const a = Math.abs(v);
+  if (a !== 0 && (a >= 1e6 || a < 1e-3)) return v.toExponential(2);
+  if (Number.isInteger(v)) return v.toLocaleString();
+  return v.toPrecision(d).replace(/\.?0+$/, m => m.includes("e") ? m : "");
+}
+function fmtLen(v, dbu) { if (v === undefined || v === null) return ""; return dbu ? fmt(v / dbu) + " µm" : fmt(v); }
+function fmtDur(s) {
+  if (s === null || s === undefined || !isFinite(s)) return "";
+  if (s < 1) return (s * 1000).toFixed(0) + " ms";
+  if (s < 60) return s.toFixed(s < 10 ? 2 : 1) + " s";
+  const m = Math.floor(s / 60), r = Math.round(s % 60);
+  if (m < 60) return m + "m " + r + "s";
+  return Math.floor(m / 60) + "h " + (m % 60) + "m";
+}
+function fmtTime(t) {
+  if (!t) return "";
+  const d = new Date(t * 1000), now = new Date();
+  const same = d.toDateString() === now.toDateString();
+  return same ? d.toLocaleTimeString() : d.toLocaleString();
+}
+function pct(v) { return v === undefined ? "" : (100 * v).toFixed(2) + "%"; }
+function pill(s) { return `<span class="pill ${esc(s)}">${esc(s)}</span>`; }
+function duration(r) { return ((r.ended || r.heartbeat || r.started) - r.started); }
+
+// ---------------------------------------------------------------- charts
+function setupCanvas(cv, h) {
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth || 600;
+  cv.style.height = h + "px"; cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); return [g, w, h];
+}
+function niceTicks(lo, hi, n = 5) {
+  if (!(hi > lo)) { hi = lo + 1; }
+  const span = hi - lo, step0 = Math.pow(10, Math.floor(Math.log10(span / n)));
+  const step = [1, 2, 5, 10].map(m => m * step0).find(s => span / s <= n) || step0 * 10;
+  const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9 * span; v += step) out.push(v); return out;
+}
+function lineChart(cv, series, o = {}) {
+  const [g, W, H] = setupCanvas(cv, o.height || 220);
+  const pad = {l: 64, r: 12, t: 10, b: 28};
+  const pts = series.flatMap(s => s.points);
+  g.clearRect(0, 0, W, H);
+  if (!pts.length) { g.fillStyle = css("--muted"); g.fillText("no data", W / 2 - 20, H / 2); return; }
+  const ylog = !!o.logy && pts.every(p => p[1] > 0);
+  const ty = v => ylog ? Math.log10(v) : v;
+  let x0 = Math.min(...pts.map(p => p[0])), x1 = Math.max(...pts.map(p => p[0]));
+  let y0 = Math.min(...pts.map(p => ty(p[1]))), y1 = Math.max(...pts.map(p => ty(p[1])));
+  if (x1 === x0) x1 = x0 + 1; if (y1 === y0) { y1 += Math.abs(y0) * 0.05 + 1e-9; y0 -= Math.abs(y0) * 0.05 + 1e-9; }
+  const X = v => pad.l + (v - x0) / (x1 - x0) * (W - pad.l - pad.r);
+  const Y = v => H - pad.b - (ty(v) - y0) / (y1 - y0) * (H - pad.t - pad.b);
+  g.strokeStyle = css("--line"); g.fillStyle = css("--muted"); g.font = "11px sans-serif"; g.lineWidth = 1;
+  for (const v of niceTicks(y0, y1)) {
+    const y = H - pad.b - (v - y0) / (y1 - y0) * (H - pad.t - pad.b);
+    g.beginPath(); g.moveTo(pad.l, y); g.lineTo(W - pad.r, y); g.stroke();
+    g.fillText(fmt(ylog ? Math.pow(10, v) : v, 3), 4, y + 4);
+  }
+  for (const v of niceTicks(x0, x1, 6)) { const x = X(v); g.fillText(fmt(v, 3), x - 10, H - 8); }
+  series.forEach((s, i) => {
+    g.strokeStyle = s.color || css(COLORS[i % COLORS.length]); g.lineWidth = 1.8; g.beginPath();
+    s.points.forEach((p, k) => { const x = X(p[0]), y = Y(p[1]); k ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.stroke();
+  });
+}
+function legend(series) {
+  return `<div class="legend">${series.map((s, i) => `<span><i style="background:${css(COLORS[i % COLORS.length])}"></i>${esc(s.name)}</span>`).join("")}</div>`;
+}
+// Sequential map 0..1 (cool -> warm), > 1 saturates to red (overflow).
+function colorAt(t) {
+  const stops = [[0, [24, 32, 64]], [0.35, [36, 104, 170]], [0.65, [64, 180, 160]], [0.85, [235, 200, 70]], [1.0, [240, 130, 40]], [1.5, [210, 40, 40]]];
+  t = Math.max(0, Math.min(1.5, t));
+  for (let i = 1; i < stops.length; i++) if (t <= stops[i][0]) {
+    const [a, ca] = stops[i - 1], [b, cb] = stops[i], f = (t - a) / (b - a || 1);
+    return ca.map((c, k) => Math.round(c + f * (cb[k] - c)));
+  }
+  return stops[stops.length - 1][1];
+}
+function heatmap(cv, m) {
+  const aspect = (m.region[3] - m.region[1]) / Math.max(1, m.region[2] - m.region[0]);
+  const w = cv.clientWidth || 500, h = Math.min(520, Math.max(160, w * aspect));
+  const [g, W, H] = setupCanvas(cv, h);
+  const ratio = m.unit === "ratio";
+  let vmax = 0; for (const v of m.values) if (v > vmax) vmax = v;
+  const scale = ratio ? 1 : (vmax || 1);
+  const img = g.createImageData(m.nx, m.ny);
+  for (let iy = 0; iy < m.ny; iy++) for (let ix = 0; ix < m.nx; ix++) {
+    const v = m.values[iy * m.nx + ix], c = colorAt(ratio ? v : v / scale), o = ((m.ny - 1 - iy) * m.nx + ix) * 4;
+    img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; img.data[o + 3] = 255;
+  }
+  const off = document.createElement("canvas"); off.width = m.nx; off.height = m.ny; off.getContext("2d").putImageData(img, 0, 0);
+  const dw = Math.min(W, H / aspect), dh = dw * aspect;
+  g.imageSmoothingEnabled = false; g.drawImage(off, 0, 0, dw, dh);
+  const tip = $("#tip");
+  cv.onmousemove = e => {
+    const r = cv.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+    if (x > dw || y > dh) { tip.style.display = "none"; return; }
+    const ix = Math.floor(x / dw * m.nx), iy = m.ny - 1 - Math.floor(y / dh * m.ny);
+    tip.style.display = "block"; tip.style.left = (e.clientX + 12) + "px"; tip.style.top = (e.clientY + 12) + "px";
+    tip.textContent = `(${ix}, ${iy})  ${fmt(m.values[iy * m.nx + ix])}`;
+  };
+  cv.onmouseleave = () => { tip.style.display = "none"; };
+  return ratio ? "colour: 0 → 1.0 utilization (blue → orange), red = above 100%" : `colour: 0 → ${fmt(vmax)} ${m.unit}`;
+}
+
+// ---------------------------------------------------------------- views
+const SUMMARY_COLS = [
+  ["hpwl", "HPWL", "len"], ["routed_wl", "routed WL", "len"], ["vias", "vias", ""], ["density_overflow", "dens. overflow", ""],
+  ["peak_util", "peak util", ""], ["cv", "CV", ""], ["route_overflow", "route overflow", ""], ["max_congestion", "max cong.", ""],
+];
+async function viewRuns() {
+  const q = $("#q").value.trim();
+  const runs = await api("api/runs?limit=300" + (q ? "&q=" + encodeURIComponent(q) : ""));
+  if (!runs.length) { $("#main").innerHTML = `<div class="panel empty">No runs yet. Run <span class="mono">hermes demo</span> or <span class="mono">hermes &lt;design_dir&gt;</span>; each run appears here live.</div>`; return; }
+  const rows = runs.map(r => {
+    const s = r.summary || {}, dbu = s.dbu_per_micron;
+    const prog = r.status === "running"
+      ? `<div class="bar"><i style="width:${(100 * (r.progress || 0)).toFixed(1)}%"></i></div><span class="muted">${esc(r.stage)}</span>`
+      : `<span class="muted">${esc(r.stage || "")}</span>`;
+    return `<tr class="click" data-id="${esc(r.id)}">
+      <td><input type="checkbox" data-sel="${esc(r.id)}" ${selected.has(r.id) ? "checked" : ""}></td>
+      <td>${pill(r.status)}</td>
+      <td><b>${esc(r.name || r.design || "")}</b><div class="muted mono">${esc(r.id)}</div></td>
+      <td>${esc(r.design)}</td><td>${esc(r.host)}<div class="muted">${r.threads || ""} threads</div></td>
+      <td>${fmtTime(r.started)}</td><td class="num">${fmtDur(duration(r))}</td><td>${prog}</td>
+      ${SUMMARY_COLS.map(([k, , t]) => `<td class="num">${t === "len" ? fmtLen(s[k], dbu) : fmt(s[k])}</td>`).join("")}
+      <td class="muted">${(r.tags || []).map(esc).join(" ")}</td></tr>`;
+  }).join("");
+  $("#main").innerHTML = `<div class="panel">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px"><h2 style="margin:0">Runs</h2>
+    <span class="muted">${runs.length} shown</span><span style="flex:1"></span>
+    <button class="primary" id="cmpbtn">Compare selected (${selected.size})</button>
+    <button id="clrbtn">Clear selection</button></div>
+    <div class="scroll"><table><thead><tr><th></th><th>status</th><th>run</th><th>design</th><th>host</th><th>started</th>
+    <th class="num">time</th><th>progress</th>${SUMMARY_COLS.map(c => `<th class="num">${c[1]}</th>`).join("")}<th>tags</th></tr></thead>
+    <tbody>${rows}</tbody></table></div></div>`;
+  for (const tr of document.querySelectorAll("tr.click")) tr.onclick = e => {
+    if (e.target.matches("input")) return; location.hash = "#/run/" + tr.dataset.id;
+  };
+  for (const cb of document.querySelectorAll("input[data-sel]")) cb.onchange = () => {
+    cb.checked ? selected.add(cb.dataset.sel) : selected.delete(cb.dataset.sel);
+    localStorageSet("hermes.sel", JSON.stringify([...selected])); $("#cmpbtn").textContent = `Compare selected (${selected.size})`;
+  };
+  $("#cmpbtn").onclick = () => { if (selected.size) location.hash = "#/compare/" + [...selected].join(","); };
+  $("#clrbtn").onclick = () => { selected.clear(); localStorageSet("hermes.sel", "[]"); route(); };
+  schedule(2000);
+}
+
+function timeline(stages, now) {
+  if (!stages.length) return "";
+  const t0 = stages[0].started, t1 = Math.max(...stages.map(s => s.ended || now));
+  const span = Math.max(1e-6, t1 - t0);
+  return `<div class="timeline">${stages.map((s, i) => {
+    const d = (s.ended || now) - s.started, w = Math.max(0.5, 100 * d / span);
+    return `<div style="width:${w}%;background:${css(COLORS[i % COLORS.length])}" title="${esc(s.name)}: ${fmtDur(d)}">${esc(s.name)} ${fmtDur(d)}</div>`;
+  }).join("")}</div>`;
+}
+
+function qorHtml(q, dbu) {
+  if (!q) return `<div class="muted">No QoR report yet (written at the end of the run).</div>`;
+  const d = q.density, e = q.evenness, c = q.congestion, w = q.wirelength;
+  const layerRows = c.layers.map((L, i) => L.routable ? `<tr><td>${esc(L.name)}</td><td>${L.dir}</td><td class="num">${fmt(L.capacity)}</td>
+     <td class="num">${fmt(L.demand)}</td><td class="num">${fmt(L.overflow)}</td><td class="num">${fmt(L.avg_util, 3)}</td>
+     <td class="num">${fmt(L.max_util, 3)}</td><td class="num">${fmt(L.overflow_gcells)}</td><td class="num">${fmtLen(L.wirelength, dbu)}</td>
+     <td class="num">${i < w.vias.length ? fmt(w.vias[i]) : ""}</td></tr>` : `<tr class="muted"><td>${esc(L.name)}</td><td>${L.dir}</td><td colspan="8">pin access only</td></tr>`).join("");
+  return `<div class="grid">
+   <div><h2>Density and evenness</h2><div class="kv">
+    <div>bins</div><div>${d.nx} × ${d.ny} (target ${fmt(d.target)})</div>
+    <div>average utilization</div><div>${fmt(d.avg_util, 3)}</div>
+    <div>peak bin utilization</div><div>${fmt(d.peak_util, 3)}</div>
+    <div>density overflow (ISPD)</div><div>${fmt(d.overflow, 4)}</div>
+    <div>utilization CV</div><div>${fmt(e.cv, 3)} <span class="muted">(std ${fmt(e.util_std, 3)} / mean ${fmt(e.util_mean, 3)})</span></div>
+    <div>overfull bins</div><div>${pct(e.overfull_share)} &gt; target, ${pct(e.over100_share)} &gt; 100%</div></div></div>
+   <div><h2>Wirelength</h2><div class="kv">
+    <div>HPWL</div><div>${fmtLen(w.hpwl, dbu)}</div>
+    <div>routed (global)</div><div>${fmtLen(w.routed, dbu)} <span class="muted">(${w.hpwl ? (w.routed / w.hpwl).toFixed(3) : ""} × HPWL)</span></div>
+    <div>vias</div><div>${fmt(w.total_vias)}${w.layers_estimated ? ' <span class="muted">(estimated)</span>' : ""}</div>
+    <div>nets / pins</div><div>${fmt(w.nets)} / ${fmt(w.pins)}</div></div></div></div>
+   <h2 style="margin-top:14px">Congestion (3-D) <span class="muted" style="font-weight:400">${c.nx}×${c.ny} GCells, layers: ${esc(c.layer_source)}${c.routed ? "" : ", not routed"}</span></h2>
+   <div class="scroll"><table><thead><tr><th>layer</th><th>dir</th><th class="num">capacity</th><th class="num">demand</th><th class="num">overflow</th>
+   <th class="num">avg</th><th class="num">max</th><th class="num">overflowed GCells</th><th class="num">wirelength</th><th class="num">vias up</th></tr></thead>
+   <tbody>${layerRows}</tbody></table></div>
+   <div class="kv" style="margin-top:8px">
+    <div>total overflow</div><div>${fmt(c.total_overflow)} tracks (H ${fmt(c.h_overflow)}, V ${fmt(c.v_overflow)}), ${fmt(c.overflow_gcells)} GCells</div>
+    <div>ACE 0.5/1/2/5%</div><div>${c.ace.map(v => fmt(v, 3)).join(" / ")} (RC ${fmt(c.rc, 3)})</div>
+    <div>RUDY estimate</div><div>H/V overflow ${fmt(c.rudy_h_overflow)} / ${fmt(c.rudy_v_overflow)}, max util ${fmt(c.rudy_max_util, 3)}, ACE ${c.rudy_ace.map(v => fmt(v, 3)).join(" / ")}</div></div>
+   ${c.hot_spots.length ? `<h2 style="margin-top:14px">Worst GCells</h2><div class="scroll"><table><thead><tr><th>GCell</th><th>box (dbu)</th><th class="num">util</th><th class="num">overflow</th><th>layer</th></tr></thead><tbody>
+     ${c.hot_spots.map(h => `<tr><td>(${h.ix}, ${h.iy})</td><td class="mono">${h.box.join(" ")}</td><td class="num">${fmt(h.util, 3)}</td><td class="num">${fmt(h.overflow)}</td><td>${esc(h.layer)}</td></tr>`).join("")}</tbody></table></div>` : ""}
+   <h2 style="margin-top:14px">Notes</h2><ul class="notes">${q.notes.map(n => `<li>${esc(n)}</li>`).join("")}</ul>
+   <div class="muted">report computed in ${fmtDur(q.seconds.total)}</div>`;
+}
+
+let logSeq = 0, logRows = [];
+async function viewRun(id) {
+  const r = await api("api/runs/" + encodeURIComponent(id));
+  const s = r.summary || {}, dbu = s.dbu_per_micron;
+  const first = $("#main").dataset.run !== id;
+  if (first) { logSeq = 0; logRows = []; }
+  const metricNames = (r.metric_names || []).filter(n => n !== "progress").sort();
+  const mets = metricNames.length ? await api(`api/runs/${encodeURIComponent(id)}/metrics?names=${metricNames.join(",")}`) : {};
+  const ev = await api(`api/runs/${encodeURIComponent(id)}/events?kind=log,stage&after=${logSeq}&limit=2000`);
+  for (const e of ev) { logSeq = Math.max(logSeq, e.seq); logRows.push(e); }
+  if (logRows.length > 5000) logRows = logRows.slice(-5000);
+  const lvl = localStorageGet("hermes.loglevel") || "info";
+  const order = {error: 1, warn: 2, info: 3, verbose: 4, debug: 5, trace: 6};
+  const logHtml = logRows.filter(e => e.kind !== "log" || (order[e.level] || 3) <= (order[lvl] || 3)).map(e =>
+    e.kind === "stage" ? `<tr><td class="muted">${fmtTime(e.t)}</td><td colspan="2"><b>▸ ${esc(e.text)}</b></td></tr>`
+      : `<tr class="lv-${esc(e.level)}"><td class="muted">${fmtTime(e.t)}</td><td class="muted">${esc(e.channel)}${e.msg_id ? " " + esc(e.msg_id) : ""}</td><td>${esc(e.text)}</td></tr>`).join("");
+  const charts = metricNames.map(n => `<div><h2>${esc(n)} <span class="muted" style="font-weight:400">vs iteration</span></h2><canvas data-metric="${esc(n)}"></canvas></div>`).join("");
+  const running = r.status === "running";
+  const keepMap = $("#mapsel") ? $("#mapsel").value : null;
+  $("#main").dataset.run = id;
+  $("#main").innerHTML = `
+  <div class="panel"><div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+    <h2 style="margin:0">${esc(r.name || r.design || r.id)}</h2>${pill(r.status)}<span class="muted mono">${esc(r.id)}</span>
+    <span style="flex:1"></span><label><input type="checkbox" id="addsel" ${selected.has(r.id) ? "checked" : ""}> select for compare</label></div>
+    ${running ? `<div style="margin:10px 0"><div class="bar" style="height:10px"><i style="width:${(100 * (r.progress || 0)).toFixed(1)}%"></i></div>
+       <div class="muted" style="margin-top:4px">${(100 * (r.progress || 0)).toFixed(1)}% · ${esc(r.stage)} · ${esc(r.message)}</div></div>` : ""}
+    ${r.error ? `<div class="lv-error" style="margin:8px 0">${esc(r.error)}</div>` : ""}
+    ${timeline(r.stages, running ? r.now : (r.ended || r.now))}
+    <div class="grid"><div class="kv">
+      <div>design</div><div>${esc(r.design)}</div><div>input</div><div class="mono">${esc(r.input)}</div>
+      <div>started</div><div>${fmtTime(r.started)}</div><div>run time</div><div>${fmtDur(duration(r))}</div>
+      <div>command</div><div class="mono">${esc(r.command)}</div><div>directory</div><div class="mono">${esc(r.cwd)}</div>
+      <div>tags</div><div>${(r.tags || []).map(esc).join(", ")}</div></div>
+    <div class="kv">
+      <div>host</div><div>${esc(r.host)} <span class="muted">${esc(r.os)}</span></div><div>cpu</div><div>${esc(r.cpu)} (${r.cores} cores)</div>
+      <div>threads</div><div>${r.threads}</div><div>memory</div><div>${r.mem_bytes ? (r.mem_bytes / 2 ** 30).toFixed(1) + " GiB" : ""}${r.peak_rss ? `, peak RSS ${(r.peak_rss / 2 ** 20).toFixed(0)} MiB` : ""}</div>
+      <div>version</div><div class="mono">${esc(r.version)}</div><div>origin</div><div>${esc(r.origin)}${r.dropped ? `, <span class="lv-warn">${r.dropped} events dropped</span>` : ""}</div></div></div></div>
+  ${r.stages.length ? `<div class="panel"><h2>Stages</h2><table><tbody>${r.stages.map(st => `<tr><td>${esc(st.name)}</td><td class="num">${fmtDur((st.ended || r.now) - st.started)}</td><td class="muted">${st.ended ? "" : "running"}</td></tr>`).join("")}</tbody></table></div>` : ""}
+  ${charts ? `<div class="panel grid">${charts}</div>` : ""}
+  <div class="panel">${qorHtml(r.results, dbu)}</div>
+  ${r.has_maps ? `<div class="panel"><h2>Maps</h2><select id="mapsel"></select> <span class="muted" id="mapnote"></span><canvas id="heat" style="margin-top:10px"></canvas></div>` : ""}
+  <div class="panel"><div style="display:flex;gap:10px;align-items:center"><h2 style="margin:0">Log</h2>
+    <select id="lvl">${["error","warn","info","verbose","debug"].map(l => `<option ${l === lvl ? "selected" : ""}>${l}</option>`).join("")}</select>
+    <span class="muted">${logRows.length} messages</span></div>
+    <div class="log mono" id="log"><table><tbody>${logHtml}</tbody></table></div></div>
+  <div class="panel"><h2>Settings</h2><pre class="mono" style="white-space:pre-wrap">${esc(JSON.stringify(r.settings, null, 2))}</pre></div>`;
+  for (const cv of document.querySelectorAll("canvas[data-metric]")) {
+    const n = cv.dataset.metric;
+    lineChart(cv, [{name: n, points: (mets[n] || []).map(p => [p[0], p[1]])}], {xlabel: "iteration", logy: /overflow/.test(n)});
+  }
+  const lg = $("#log"); lg.scrollTop = lg.scrollHeight;
+  $("#lvl").onchange = e => { localStorageSet("hermes.loglevel", e.target.value); viewRun(id); };
+  $("#addsel").onchange = e => { e.target.checked ? selected.add(id) : selected.delete(id); localStorageSet("hermes.sel", JSON.stringify([...selected])); };
+  if (r.has_maps) {
+    const maps = await api(`api/runs/${encodeURIComponent(id)}/maps`);
+    const sel = $("#mapsel");
+    sel.innerHTML = maps.map((m, i) => `<option value="${i}">${esc(m.name)}</option>`).join("");
+    const k = maps.findIndex(m => m.name === (keepMap !== null && maps[keepMap] ? maps[keepMap].name : "congestion.h.util"));
+    sel.value = String(keepMap !== null && maps[keepMap] ? keepMap : Math.max(0, k));
+    const draw = () => { $("#mapnote").textContent = heatmap($("#heat"), maps[+sel.value]); };
+    sel.onchange = draw; draw();
+  }
+  if (running) schedule(1000);
+}
+
+function flatten(o, p = "", out = {}) {
+  for (const [k, v] of Object.entries(o || {})) {
+    if (v && typeof v === "object" && !Array.isArray(v)) flatten(v, p + k + ".", out); else out[p + k] = v;
+  }
+  return out;
+}
+const LOWER_BETTER = /hpwl|wl|vias|overflow|util|cv|share|congestion|rc|_s$/;
+async function viewCompare(ids) {
+  if (!ids.length) { $("#main").innerHTML = `<div class="panel empty">Select runs on the Runs page (checkboxes), then press Compare.</div>`; return; }
+  const runs = await Promise.all(ids.map(id => api("api/runs/" + encodeURIComponent(id)).catch(() => null)));
+  const rs = runs.filter(Boolean);
+  const keys = [...new Set(rs.flatMap(r => Object.keys(r.summary || {})))].filter(k => k !== "dbu_per_micron").sort();
+  const base = rs[0].summary || {};
+  const row = k => `<tr><td>${esc(k)}</td>${rs.map((r, i) => {
+    const v = (r.summary || {})[k], b = base[k];
+    let delta = "";
+    if (i > 0 && typeof v === "number" && typeof b === "number" && b !== 0) {
+      const d = (v - b) / Math.abs(b), good = LOWER_BETTER.test(k) ? d < 0 : d > 0;
+      if (Math.abs(d) > 1e-9) delta = ` <span class="${good ? "better" : "worse"}">${d > 0 ? "+" : ""}${(100 * d).toFixed(2)}%</span>`;
+    }
+    return `<td class="num">${fmt(v)}${delta}</td>`;
+  }).join("")}</tr>`;
+  const flat = rs.map(r => flatten(r.settings));
+  const skeys = [...new Set(flat.flatMap(f => Object.keys(f)))].sort().filter(k => new Set(flat.map(f => JSON.stringify(f[k]))).size > 1);
+  const meta = [["design", r => r.design], ["host", r => r.host], ["threads", r => r.threads], ["version", r => r.version],
+    ["started", r => fmtTime(r.started)], ["run time", r => fmtDur(duration(r))], ["status", r => r.status]];
+  const stageNames = [...new Set(rs.flatMap(r => r.stages.map(s => s.name)))];
+  const head = `<tr><th></th>${rs.map((r, i) => `<th class="num"><a href="#/run/${esc(r.id)}" style="color:${css(COLORS[i % COLORS.length])}">${esc(r.name || r.id)}</a></th>`).join("")}</tr>`;
+  const mnames = [...new Set(rs.flatMap(r => r.metric_names || []))].filter(n => n !== "progress").sort();
+  $("#main").innerHTML = `
+   <div class="panel"><h2>Comparing ${rs.length} runs <span class="muted" style="font-weight:400">(deltas against the first)</span></h2><div class="scroll"><table>
+   <thead>${head}</thead><tbody>${meta.map(([k, f]) => `<tr><td>${k}</td>${rs.map(r => `<td class="num">${esc(f(r))}</td>`).join("")}</tr>`).join("")}
+   <tr><td colspan="${rs.length + 1}"><b>results</b></td></tr>${keys.map(row).join("")}
+   <tr><td colspan="${rs.length + 1}"><b>stage times</b></td></tr>
+   ${stageNames.map(n => `<tr><td>${esc(n)}</td>${rs.map(r => { const s = r.stages.find(x => x.name === n); return `<td class="num">${s ? fmtDur((s.ended || r.now) - s.started) : ""}</td>`; }).join("")}</tr>`).join("")}
+   <tr><td colspan="${rs.length + 1}"><b>settings that differ</b></td></tr>
+   ${skeys.length ? skeys.map(k => `<tr><td class="mono">${esc(k)}</td>${flat.map(f => `<td class="num mono">${esc(JSON.stringify(f[k]))}</td>`).join("")}</tr>`).join("") : `<tr><td class="muted" colspan="${rs.length + 1}">none</td></tr>`}
+   </tbody></table></div></div>
+   <div class="panel grid">${mnames.map(n => `<div><h2>${esc(n)} <span class="muted" style="font-weight:400">vs iteration</span></h2><canvas data-cmp="${esc(n)}"></canvas><div data-leg="${esc(n)}"></div></div>`).join("")}</div>`;
+  for (const n of mnames) {
+    const data = await Promise.all(rs.map(r => api(`api/runs/${encodeURIComponent(r.id)}/metrics?names=${n}`)));
+    const series = data.map((d, i) => ({name: rs[i].name || rs[i].id, points: (d[n] || []).map(p => [p[0], p[1]])}));
+    lineChart(document.querySelector(`canvas[data-cmp="${CSS.escape(n)}"]`), series, {xlabel: "iteration", logy: /overflow/.test(n)});
+    document.querySelector(`div[data-leg="${CSS.escape(n)}"]`).innerHTML = legend(series);
+  }
+  if (rs.some(r => r.status === "running")) schedule(3000);
+}
+
+function schedule(ms) { clearTimeout(timer); timer = setTimeout(route, ms); }
+async function route() {
+  clearTimeout(timer);
+  const h = location.hash.replace(/^#\/?/, "");
+  $("#nav-runs").className = h.startsWith("compare") ? "" : "on";
+  $("#nav-cmp").className = h.startsWith("compare") ? "on" : "";
+  try {
+    if (h.startsWith("run/")) await viewRun(decodeURIComponent(h.slice(4)));
+    else if (h.startsWith("compare")) await viewCompare(h.slice(8).split(",").filter(Boolean));
+    else await viewRuns();
+    $("#live").innerHTML = "<b></b>live";
+  } catch (e) {
+    $("#live").innerHTML = `<b style="background:var(--bad)"></b>${esc(e.message)}`;
+    schedule(5000);
+  }
+}
+window.addEventListener("hashchange", () => { $("#main").dataset.run = ""; route(); });
+let qt = null; $("#q").addEventListener("input", () => { clearTimeout(qt); qt = setTimeout(() => { if (location.hash.length > 2) location.hash = "#/"; else route(); }, 250); });
+window.addEventListener("resize", () => { clearTimeout(qt); qt = setTimeout(route, 200); });
+route();
+</script>
+</body>
+</html>

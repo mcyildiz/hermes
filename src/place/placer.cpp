@@ -1,6 +1,7 @@
 #include "hermes/place/placer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <format>
 #include <optional>
@@ -30,9 +31,13 @@ namespace {
 /// do not depend on the number of threads.
 class NesterovPlacer {
  public:
+  /// `filler_init` (x0, y0, x1, y1, ...): start positions for the fillers,
+  /// e.g. those of an earlier placer on the same design (extra fillers start
+  /// at random, surplus positions are ignored).
   NesterovPlacer(Design& design, const PlacerOptions& opts,
-                 const std::vector<double>& net_weight, compute::Backend& be)
-      : d_(design), opts_(opts), net_weight_(net_weight), be_(be) {
+                 const std::vector<double>& net_weight, compute::Backend& be,
+                 const std::vector<double>* filler_init = nullptr)
+      : d_(design), opts_(opts), net_weight_(net_weight), be_(be), filler_init_(filler_init) {
     build_objects();
     build_grid();
     build_fillers();
@@ -49,6 +54,21 @@ class NesterovPlacer {
   double gamma() const { return gamma_; }
   double alpha() const { return alpha_; }
   int num_fillers() const { return num_ - num_cells_; }
+
+  /// Current filler centers (x0, y0, x1, y1, ...).
+  std::vector<double> filler_positions() const {
+    std::vector<double> v;
+    v.reserve(2 * static_cast<std::size_t>(num_ - num_cells_));
+    for (int k = num_cells_; k < num_; ++k) {
+      v.push_back(u_[k]);
+      v.push_back(u_[num_ + k]);
+    }
+    return v;
+  }
+
+  /// Density penalty to start from (instead of the gradient-balanced
+  /// lambda_0); call before the first step().
+  void set_lambda(double lambda) { lambda_ = lambda; }
 
   /// Recomputes inflated charges (inflation per design cell, area factor).
   void set_inflation(const std::vector<double>& inflation) {
@@ -353,9 +373,12 @@ class NesterovPlacer {
         u_[num_ + k] = cy + dy;
       }
     }
+    const std::size_t given = filler_init_ ? filler_init_->size() / 2 : 0;
     for (int k = num_cells_; k < num_; ++k) {
-      u_[k] = filler_pos_[2 * (k - num_cells_)];
-      u_[num_ + k] = filler_pos_[2 * (k - num_cells_) + 1];
+      const std::size_t f = static_cast<std::size_t>(k - num_cells_);
+      const std::vector<double>& src = f < given ? *filler_init_ : filler_pos_;
+      u_[k] = src[2 * f];
+      u_[num_ + k] = src[2 * f + 1];
     }
     clamp(u_);
     charge_w_.assign(num_, 0.0);
@@ -470,6 +493,7 @@ class NesterovPlacer {
   const PlacerOptions& opts_;
   const std::vector<double>& net_weight_;  // PlacerState::net_weight
   compute::Backend& be_;
+  const std::vector<double>* filler_init_ = nullptr;
   int num_cells_ = 0, num_ = 0, max_degree_ = 0;
   std::vector<Id> cell_;
   std::vector<double> w_, h_;
@@ -600,10 +624,19 @@ PlacementResult MixedSizePlacer::run(Design& design, StaEngine* sta,
   report(0.85, "legalization");
 
   if (opts_.legalize) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool movable_macros = std::any_of(design.cells().begin(), design.cells().end(),
+                                            [](const Cell& c) { return c.is_macro && c.movable(); });
     legalize_macros(design);
     design.flush();
+    if (movable_macros && !gp.empty()) {
+      res.refine_iterations =
+          refine_after_macros(design, gp.filler_positions(), gp.lambda(), res, ctl);
+    }
     legalize_cells(design);
     design.flush();
+    res.legalize_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   }
   if (ctl && ctl->cancelled()) {
     res.cancelled = true;
@@ -710,6 +743,103 @@ void MixedSizePlacer::legalize_macros(Design& design) {
     const Cell& cell = design.cells()[ci];
     if (cell.is_macro && !cell.removed) design.set_fixed(ci, true);
   }
+}
+
+namespace {
+
+/// Fraction of the movable std-cell area that overlaps a macro.
+double std_area_on_macros(const Design& design) {
+  const auto cells = design.cells();
+  std::vector<Rect> macros;
+  double std_area = 0.0;
+  for (const Cell& c : cells) {
+    if (c.removed) continue;
+    if (c.is_macro) macros.push_back(c.bbox());
+    else if (c.movable()) std_area += static_cast<double>(c.width) * static_cast<double>(c.height);
+  }
+  if (macros.empty() || std_area <= 0.0) return 0.0;
+  // Bucket the macros on a coarse grid; each cell checks its buckets only.
+  const Rect& die = design.die();
+  const int n = std::clamp(static_cast<int>(std::sqrt(static_cast<double>(macros.size()))) * 2, 1, 64);
+  const double bw = std::max(1.0, static_cast<double>(die.width()) / n);
+  const double bh = std::max(1.0, static_cast<double>(die.height()) / n);
+  auto bx = [&](Dbu x) { return std::clamp(static_cast<int>((x - die.xlo) / bw), 0, n - 1); };
+  auto by = [&](Dbu y) { return std::clamp(static_cast<int>((y - die.ylo) / bh), 0, n - 1); };
+  std::vector<std::vector<int>> bucket(static_cast<std::size_t>(n) * n);
+  for (int m = 0; m < static_cast<int>(macros.size()); ++m) {
+    const Rect& r = macros[m];
+    for (int iy = by(r.ylo); iy <= by(r.yhi); ++iy)
+      for (int ix = bx(r.xlo); ix <= bx(r.xhi); ++ix) bucket[iy * n + ix].push_back(m);
+  }
+  const double over = par::parallel_reduce(
+      0, cells.size(), 8192, 0.0,
+      [&](std::size_t lo, std::size_t hi) {
+        double sum = 0.0;
+        for (std::size_t i = lo; i < hi; ++i) {
+          const Cell& c = cells[i];
+          if (c.removed || c.is_macro || !c.movable()) continue;
+          const Rect b = c.bbox();
+          // A cell is much smaller than a bucket: its lower-left bucket is
+          // enough unless it straddles a bucket edge.
+          for (int iy = by(b.ylo); iy <= by(b.yhi); ++iy)
+            for (int ix = bx(b.xlo); ix <= bx(b.xhi); ++ix)
+              for (int m : bucket[iy * n + ix]) {
+                // Count each (cell, macro) pair once: in the first shared bucket.
+                const Rect& r = macros[m];
+                if (std::max(bx(b.xlo), bx(r.xlo)) != ix || std::max(by(b.ylo), by(r.ylo)) != iy) continue;
+                sum += static_cast<double>(b.overlap_area(r));
+              }
+        }
+        return sum;
+      },
+      [](double a, double b) { return a + b; });
+  return over / std_area;
+}
+
+}  // namespace
+
+int MixedSizePlacer::refine_after_macros(Design& design, const std::vector<double>& fillers,
+                                         double lambda, PlacementResult& res, RunControl* ctl) {
+  res.macro_overlap = std_area_on_macros(design);
+  if (opts_.refine_iterations <= 0 || res.macro_overlap <= opts_.refine_min_overlap) {
+    HLOG_VERBOSE(log_lg, "refinement skipped: {:.3f}% of std-cell area on macros",
+                 100.0 * res.macro_overlap);
+    return 0;
+  }
+  PlacerOptions ro = opts_;
+  ro.keep_placed = true;  // Start from the global placement.
+  NesterovPlacer gp(design, ro, state_.net_weight, compute::backend(), &fillers);
+  if (gp.empty()) return 0;
+  gp.set_inflation(state_.inflation);
+  gp.set_lambda(lambda * opts_.refine_lambda_scale);
+  const double h0 = total_hpwl(design);
+  int it = 0;
+  // Done once the density overflow is back under stop_overflow and the
+  // cells are off the macros (checked every few iterations: it needs a
+  // write-back).
+  constexpr int kCheckEvery = 5;
+  double on_macros = res.macro_overlap;
+  for (it = 1; it <= opts_.refine_iterations; ++it) {
+    if (ctl && ctl->cancelled()) break;
+    gp.step();
+    if (it % kCheckEvery == 0 && gp.overflow() < opts_.stop_overflow) {
+      gp.write_back();
+      on_macros = std_area_on_macros(design);
+      if (on_macros <= opts_.refine_min_overlap) break;
+    }
+  }
+  it = std::min(it, opts_.refine_iterations);
+  gp.write_back();
+  for (Id ci = 0; ci < static_cast<Id>(design.num_cells()); ++ci) {
+    if (design.cells()[ci].movable()) clamp_to_die(design, ci);
+  }
+  design.flush();
+  HLOG_VERBOSE(log_lg,
+               "refinement: {:.3f}% of std-cell area on macros, {} iterations, overflow {:.4f}, "
+               "HPWL {:.6g} -> {:.6g} ({:+.2f}%), now {:.3f}% on macros",
+               100.0 * res.macro_overlap, it, gp.overflow(), h0, total_hpwl(design),
+               100.0 * (total_hpwl(design) / h0 - 1.0), 100.0 * on_macros);
+  return it;
 }
 
 void MixedSizePlacer::legalize_cells(Design& design) {

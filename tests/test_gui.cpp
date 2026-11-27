@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <string>
 #include <thread>
@@ -382,6 +383,105 @@ void test_commands() {
   CHECK(reg.run(ctx, "quit").ok && v.quit);
 }
 
+/// Runs a script to the end the way the batch mode does.
+void run_script(ScriptRunner& sr, CommandContext& ctx, const CommandRegistry& reg, std::vector<std::string>* seen = nullptr) {
+  for (int k = 0; k < 20000; ++k) {
+    sr.step(ctx, reg, [&](const std::string& line, const CommandResult&) {
+      if (seen) seen->push_back(line);
+    });
+    if (sr.failed()) return;
+    if (sr.idle() && !ctx.session.busy()) {
+      sr.step(ctx, reg);
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  CHECK(false);  // did not finish
+}
+
+// Each step is its own command; a script runs them in order, each waiting
+// for the previous job, with no 'wait' in between.
+void test_step_commands() {
+  Session s;
+  s.adopt(small(3000, SyntheticOptions::Placement::Unplaced));
+  StubView v;
+  CommandContext ctx{s, v};
+  CommandRegistry reg;
+  for (const char* n : {"place", "global_place", "legalize", "global_route", "timing", "qor", "flow", "save", "source"})
+    CHECK(reg.find(n) != nullptr);
+  CHECK(!reg.run(ctx, "place bogus=1").ok);
+  CHECK(!reg.run(ctx, "global_route mode=sideways").ok);
+  CHECK(!reg.run(ctx, "legalize region=1,2,3").ok);
+  ScriptRunner sr;
+  sr.add({"global_place iters=80", "legalize", "global_route", "timing clock=200", "qor"});
+  run_script(sr, ctx, reg);
+  CHECK(!sr.failed());
+  CHECK(s.last_placement() && s.last_placement()->iterations > 0);
+  CHECK(s.last_legalize() && s.last_legalize()->legal);
+  CHECK(s.last_route() && !s.last_route()->incremental && s.last_route()->stats.nets_routed > 0);
+  CHECK(s.last_timing() && s.last_timing()->clock_period_ps == 200.0);
+  CHECK(s.qor() && s.qor()->congestion.routed);
+  const double wl = s.last_route()->stats.wirelength;
+
+  // A small edit, then global_route is incremental (the router kept its routes).
+  sr.add({"move u7 30 30", "legalize region=20,20,40,40", "global_route"});
+  run_script(sr, ctx, reg);
+  CHECK(!sr.failed());
+  CHECK(s.last_route()->incremental);
+  CHECK(s.last_route()->stats.wirelength > 0.5 * wl);
+  sr.push("global_route mode=full");
+  run_script(sr, ctx, reg);
+  CHECK(!s.last_route()->incremental);
+
+  // A failing command stops the script; the rest does not run.
+  std::vector<std::string> seen;
+  sr = ScriptRunner{};
+  sr.add({"timing", "move nosuchcell 1 1", "timing"});
+  run_script(sr, ctx, reg, &seen);
+  CHECK(sr.failed() && sr.error().find("nosuchcell") != std::string::npos);
+  CHECK(seen.size() == 2);
+
+  // place route=1 runs placement and then routing in one job.
+  sr = ScriptRunner{};
+  sr.push("place iters=60 route=1");
+  run_script(sr, ctx, reg);
+  CHECK(!sr.failed() && s.last_route() && !s.last_route()->incremental);
+
+  // source: a command file runs in place, before the next line.
+  const auto dir = std::filesystem::temp_directory_path() / "hermes_gui_test_source";
+  std::filesystem::create_directories(dir);
+  {
+    std::ofstream f(dir / "steps.cmd");
+    f << "# comment\ntiming \\\n  clock=300\necho done\n";
+  }
+  const auto lines = read_command_file((dir / "steps.cmd").string());
+  CHECK(lines.size() == 3 && lines[1].find("clock=300") != std::string::npos);
+  seen.clear();
+  sr = ScriptRunner{};
+  sr.add({"source \"" + (dir / "steps.cmd").string() + "\"", "echo after"});
+  run_script(sr, ctx, reg, &seen);
+  CHECK(!sr.failed() && s.last_timing()->clock_period_ps == 300.0);
+  CHECK(!seen.empty() && seen.back() == "echo after");
+  CHECK((split_commands("place; global_route ;timing") == std::vector<std::string>{"place", "global_route ", "timing"}));
+  std::filesystem::remove_all(dir);
+}
+
+// Routing on its own: a placed design straight from a file routes without a
+// placement step.
+void test_route_standalone() {
+  Session s;
+  s.adopt(small(2000, SyntheticOptions::Placement::Ordered));
+  StubView v;
+  CommandContext ctx{s, v};
+  CommandRegistry reg;
+  ScriptRunner sr;
+  sr.add({"global_route", "timing"});
+  run_script(sr, ctx, reg);
+  CHECK(!sr.failed());
+  CHECK(!s.last_placement());
+  CHECK(s.last_route() && s.last_route()->stats.nets_routed > 0);
+}
+
 }  // namespace
 
 int main() {
@@ -401,6 +501,8 @@ int main() {
       {"session_flow_nonblocking", test_session_flow_nonblocking},
       {"session_open_hdb", test_session_open_hdb},
       {"commands", test_commands},
+      {"step_commands", test_step_commands},
+      {"route_standalone", test_route_standalone},
   };
   for (const auto& t : tests) {
     const int before = g_failures;

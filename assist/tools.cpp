@@ -583,7 +583,7 @@ void add_builtin_tools(ToolRegistry& R) {
                  {"timeout_s", prop("number", "Seconds to wait when wait=true (default 600)")}}),
          Access::Change, [](ToolContext& c, const Json& a) {
            const bool route = bool_arg(a, "route", true);
-           std::string line = route ? "run" : "place";
+           std::string line = route ? "flow" : "flow route=0";
            for (const auto& [k, v] : a["options"].members()) {
              if (!v.is_number() && !v.is_bool()) return fail("option '" + k + "' must be a number");
              line += std::format(" {}={}", k, v.is_bool() ? (v.as_bool() ? 1.0 : 0.0) : v.as_number());
@@ -742,16 +742,12 @@ ToolResult call_tool_blocking(const ToolRegistry& reg, ToolContext& ctx, std::st
 
 // --- HeadlessView -----------------------------------------------------------------
 
-bool HeadlessView::set_layer(std::string_view, int, int, std::string* why) {
-  if (why) *why = "no viewer in this session (headless)";
-  return false;
-}
-bool HeadlessView::set_heatmap(std::string_view, std::string* why) {
-  if (why) *why = "no viewer in this session (headless)";
-  return false;
-}
+// View settings are accepted and ignored, so one script runs with or
+// without the GUI.
+bool HeadlessView::set_layer(std::string_view, int, int, std::string*) { return true; }
+bool HeadlessView::set_heatmap(std::string_view, std::string*) { return true; }
 bool HeadlessView::screenshot(const std::string&, std::string* why) {
-  if (why) *why = "no viewer in this session (headless): use hermes_gui --screenshot";
+  if (why) *why = "no viewer in this session (headless): run hermes with the GUI for screenshots";
   return false;
 }
 bool HeadlessView::select_cell(std::string_view name, bool, std::string* why) {

@@ -83,10 +83,17 @@ class App final : public ViewApi {
   std::string selection_text() const override;
 
   // Commands / scripts.
+  /// Console input, buttons, drops: view commands (and cancel) run at once;
+  /// a step that needs the design waits behind the running job (queued).
   void run_command(const std::string& line, bool echo = true);
   void add_script(const std::vector<std::string>& lines);
-  bool script_running() const { return !script_.empty() || script_wait_; }
+  bool script_running() const { return !script_.idle(); }
+  std::size_t queued_commands() const { return script_.pending(); }
+  /// With exit: quit once the startup commands are done and no job runs
+  /// (on a failed command: exit code 1).
   void set_exit_after_script(bool on) { exit_after_script_ = on; }
+  int exit_code() const { return exit_code_; }
+  bool screenshot_pending() const override { return !screenshot_path_.empty(); }
 
   // --- state the UI reads/writes (ui.cpp) --------------------------------
   Session session;
@@ -193,9 +200,11 @@ class App final : public ViewApi {
   Point drag_offset_;
   // Screenshot / script.
   std::string screenshot_path_;
-  std::deque<std::string> script_;
-  std::function<bool()> script_wait_;
+  void execute(const std::string& line, bool echo);
+  void show_result(const std::string& line, const CommandResult& r, bool echo);
+  ScriptRunner script_;
   bool exit_after_script_ = false;
+  int exit_code_ = 0;
   bool quit_ = false;
   std::chrono::steady_clock::time_point last_frame_;
   double update_ms_ = 0;

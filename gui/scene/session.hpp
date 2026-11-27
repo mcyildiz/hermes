@@ -21,6 +21,8 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -29,6 +31,7 @@
 #include "hermes/db/snapshot.hpp"
 #include "hermes/db/synthetic.hpp"
 #include "hermes/flow/flow.hpp"
+#include "hermes/flow/steps.hpp"
 #include "hermes/io/common.hpp"
 #include "hermes/log/sinks.hpp"
 #include "hermes/par/job.hpp"
@@ -41,6 +44,31 @@ struct LogLine {
   std::string channel;
   std::string text;
   double elapsed_s = 0.0;
+};
+
+/// What a background task leaves behind; poll() publishes it on the UI
+/// thread (Session::last_placement() etc.).
+struct TaskOutput {
+  std::optional<PlacementResult> placement;
+  std::optional<LegalizeStepResult> legalize;
+  std::optional<RouteStepResult> route;
+  std::optional<TimingStepResult> timing;
+  std::shared_ptr<QorReport> qor;
+  std::shared_ptr<FlowReport> flow;
+  /// Logged (channel "cmd") and shown in the console when the task ends.
+  std::string summary;
+};
+
+/// A background task on the session's design and engine state. It runs on
+/// the job thread with exclusive access to both.
+using SessionTask = std::function<void(Design&, FlowEngines&, RunControl&, TaskOutput&)>;
+
+/// How the last job ended (scripts stop on a failed job).
+struct JobEnd {
+  std::string kind;
+  JobState state = JobState::Done;
+  std::string error;
+  std::uint64_t serial = 0;   ///< Counts finished jobs.
 };
 
 class Session {
@@ -72,9 +100,15 @@ class Session {
   const JobHandle& job() const { return job_; }
   std::string job_kind() const { return job_kind_; }
   JobProgress job_progress() const;
+  /// Runs `task` as a background job named `kind` ("placement", "global
+  /// route", ...). `edits`: the task changes the design (undo history is
+  /// dropped). False (and *why) without a design or while a job runs.
+  bool start_task(std::string kind, SessionTask task, bool edits, std::string* why = nullptr);
+  /// The full flow (place, route, timing, QoR) on the session's engines.
   bool start_flow(const FlowOptions& opts, std::string* why = nullptr);
-  bool start_qor(std::string* why = nullptr);
-  bool save(const std::string& path, std::string* why = nullptr);
+  bool start_qor(std::string* why = nullptr, QorOptions opts = {});
+  /// Saves (.hdb) or writes (.def .pl .aux: io::write_design) the design.
+  bool save(const std::string& path, std::string* why = nullptr, const io::Options& opts = {});
   void cancel();
   /// Blocks until the current job ends (scripts, tests), then polls.
   void wait();
@@ -84,8 +118,15 @@ class Session {
   void set_job_threads(int n) { job_threads_ = n; }
   int job_threads() const;
 
-  // --- Results ---------------------------------------------------------------
+  /// How the last finished job ended (null before any).
+  const JobEnd* last_end() const { return last_end_.serial ? &last_end_ : nullptr; }
+
+  // --- Results (UI thread; set when a task ends) -----------------------------
   std::shared_ptr<const FlowReport> last_flow() const { return flow_report_done_; }
+  std::shared_ptr<const PlacementResult> last_placement() const { return placement_; }
+  std::shared_ptr<const LegalizeStepResult> last_legalize() const { return legalize_; }
+  std::shared_ptr<const RouteStepResult> last_route() const { return route_; }
+  std::shared_ptr<const TimingStepResult> last_timing() const { return timing_; }
   std::shared_ptr<const QorReport> qor() const { return qor_; }
   std::uint64_t qor_version() const { return qor_version_; }
 
@@ -115,14 +156,22 @@ class Session {
 
   JobHandle job_;
   std::string job_kind_;
+  bool job_edits_ = false;
+  JobEnd last_end_;
+  /// Engine state for the current design (routes, timing settings). Only
+  /// jobs touch it.
+  std::unique_ptr<FlowEngines> engines_;
+  std::shared_ptr<TaskOutput> task_out_;
+  std::shared_ptr<const PlacementResult> placement_;
+  std::shared_ptr<const LegalizeStepResult> legalize_;
+  std::shared_ptr<const RouteStepResult> route_;
+  std::shared_ptr<const TimingStepResult> timing_;
   int job_threads_ = 0;
   // Job outputs, filled on the job thread, picked up by poll().
   std::mutex mu_;
   std::unique_ptr<Loaded> loaded_;
   std::string load_error_;
-  std::shared_ptr<FlowReport> flow_report_;      // being filled by a flow job
   std::shared_ptr<const FlowReport> flow_report_done_;
-  std::shared_ptr<QorReport> qor_pending_;
   std::shared_ptr<const QorReport> qor_;
   std::uint64_t qor_version_ = 0;
 

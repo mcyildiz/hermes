@@ -64,6 +64,7 @@ add_library(hermes_core
   src/track/run_tracker.cpp
   src/track/http_post.cpp
   src/flow/flow.cpp
+  src/flow/steps.cpp
   src/region/region.cpp
   src/io/common.cpp
   src/io/lefdef.cpp
@@ -226,16 +227,24 @@ if(HERMES_BUILD_GUI)
     hermes_embed_file(${IMGUI_DIR}/fonts/Roboto-Medium.ttf ${HERMES_GUI_GEN}/font_ui.inc kFontUi)
     hermes_embed_file(${IMGUI_DIR}/fonts/Cousine-Regular.ttf ${HERMES_GUI_GEN}/font_mono.inc kFontMono)
 
-    add_executable(hermes_gui
-      gui/app/main.cpp
+    # The window (App, renderer, panels, run_gui()): linked into `hermes`
+    # (which opens it by default) and the hermes_gui viewer.
+    add_library(hermes_gui_app STATIC
+      gui/app/launch.cpp
       gui/app/app.cpp
       gui/app/gl_renderer.cpp
       gui/app/ui.cpp)
-    target_include_directories(hermes_gui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb ${HERMES_GUI_GEN})
-    target_link_libraries(hermes_gui PRIVATE hermes_gui_scene hermes_assist hermes_imgui)
+    target_include_directories(hermes_gui_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb ${HERMES_GUI_GEN})
+    target_link_libraries(hermes_gui_app PUBLIC hermes_gui_scene hermes_assist hermes_imgui)
     if(NOT APPLE)
-      target_compile_definitions(hermes_gui PRIVATE GL_GLEXT_PROTOTYPES)
+      target_compile_definitions(hermes_gui_app PRIVATE GL_GLEXT_PROTOTYPES)
+    endif()
+    add_executable(hermes_gui gui/app/main.cpp)
+    target_link_libraries(hermes_gui PRIVATE hermes_gui_app)
+    if(TARGET hermes)
+      target_link_libraries(hermes PRIVATE hermes_gui_app)
+      target_compile_definitions(hermes PRIVATE HERMES_HAVE_GUI=1)
     endif()
   endif()
 endif()

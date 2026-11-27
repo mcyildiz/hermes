@@ -78,7 +78,8 @@ void usage() {
       "  --checkpoint       also save <out>/<design>.placed.hdb after placement\n"
       "  --place-only       skip routing\n"
       "  --opt K=V          reader/writer/flow option, e.g. bookshelf.scale=10,\n"
-      "                     def.allow_unknown_macros=1, place.keep_placed=0; repeatable\n"
+      "                     def.allow_unknown_macros=1, place.keep_placed=0,\n"
+      "                     place.legalize=0, place.refine_iterations=0; repeatable\n"
       "  --threads N        worker threads (default: all; env HERMES_THREADS)\n"
       "  --clock-period PS  clock period for the embedded STA (default 1000)\n"
       "  --no-qor           skip the end-of-run QoR report (<out>/<design>.qor.txt/.json)\n"
@@ -231,12 +232,20 @@ void emit_qor(const FlowReport& r, const std::string& out, const std::string& de
   std::ofstream(base.string() + ".qor.json") << qor_to_json(r.qor);
 }
 
+/// --opt place.* settings shared by 'run' and 'demo'.
+void apply_placer_options(FlowOptions& fo, const RunArgs& a) {
+  fo.placer.legalize = a.opts.get_bool("place.legalize", fo.placer.legalize);
+  fo.placer.refine_iterations =
+      static_cast<int>(a.opts.get_int("place.refine_iterations", fo.placer.refine_iterations));
+}
+
 int run_demo(const RunArgs& a) {
   Design d = make_demo_design();
   FlowOptions opts;
   opts.clock_period_ps = 50.0;
   opts.router.grid_x = opts.router.grid_y = 32;
   opts.report_qor = a.qor;
+  apply_placer_options(opts, a);
   auto tr = start_tracking(a, "demo", opts);
   if (tr) tr->set_design(d.name());
   RunControl ctl(0.0);
@@ -341,6 +350,7 @@ int cmd_run(const RunArgs& a) {
   fo.clock_period_ps = a.clock_period_ps;
   fo.run_routing = !a.place_only;
   fo.placer.keep_placed = a.opts.get_bool("place.keep_placed", true);
+  apply_placer_options(fo, a);
   fo.report_qor = a.qor;
   std::string input = a.input;
   if (!a.def.empty()) {

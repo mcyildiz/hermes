@@ -421,6 +421,7 @@ void test_step_commands() {
   CHECK(s.last_route() && !s.last_route()->incremental && s.last_route()->stats.nets_routed > 0);
   CHECK(s.last_timing() && s.last_timing()->clock_period_ps == 200.0);
   CHECK(s.qor() && s.qor()->congestion.routed);
+  for (const auto& n : s.qor()->notes) CHECK(n.find("changed after the last global route") == std::string::npos);
   const double wl = s.last_route()->stats.wirelength;
 
   // A small edit, then global_route is incremental (the router kept its routes).

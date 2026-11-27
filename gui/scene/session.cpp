@@ -211,9 +211,12 @@ bool Session::start_task(std::string kind, SessionTask task, bool edits, std::st
   FlowEngines* eng = engines_.get();
   job_ = start_job(
       kind,
-      [d, eng, out, task = std::move(task)](RunControl& ctl) {
+      [d, eng, out, edits, task = std::move(task)](RunControl& ctl) {
         task(*d, *eng, ctl, *out);
-        d->flush();  // Whatever the task left unflushed reaches the snapshots.
+        // Whatever an editing task left unflushed reaches the snapshots. A
+        // read-only task (route, timing, QoR) must not flush: that bumps the
+        // design version and would mark the routes as out of date.
+        if (edits) d->flush();
       },
       jo);
   return true;

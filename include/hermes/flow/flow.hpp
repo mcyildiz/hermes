@@ -9,6 +9,7 @@
 #include "hermes/qor/qor.hpp"
 #include "hermes/route/detailed_router.hpp"
 #include "hermes/route/global_router.hpp"
+#include "hermes/flow/steps.hpp"
 
 namespace hermes {
 
@@ -52,6 +53,11 @@ std::string flow_options_json(const FlowOptions& opts);
 /// placement) when cancelled. Use start_flow_job() to run it in the
 /// background.
 FlowReport run_flow(Design& design, const FlowOptions& opts = {}, RunControl* ctl = nullptr);
+
+/// run_flow() with engine state that outlives it (the routes stay in
+/// `eng.router` for later incremental steps). opts.router and the timing
+/// settings are copied into `eng`.
+FlowReport run_flow(Design& design, FlowEngines& eng, const FlowOptions& opts, RunControl* ctl = nullptr);
 
 /// run_flow() as a background job. `report` (if given) is filled when the job
 /// ends; it and `design` must outlive the job.

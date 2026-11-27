@@ -21,6 +21,49 @@ The `GlobalRouter` acts as the congestion oracle *inside* placement and also doe
 the real global route afterward. Both stages share one `CongestionMap`, so they
 agree on what counts as congested.
 
+## Running hermes
+
+hermes does nothing on its own: it loads the design and waits for commands.
+Every engine is a command, and the same commands work in the GUI console, in
+a command file, in the headless console and for the AI assistant.
+
+```bash
+hermes path/to/design                       # GUI opens with the design loaded; type commands in its console (`)
+hermes path/to/design -c "place; global_route; timing"   # ... and run these after it loads
+hermes path/to/design -s flow.cmd           # ... or a command file (one command per line, # comments)
+hermes path/to/design --no-gui -s flow.cmd  # batch: no window, run the file, exit (code 1 if a step fails)
+hermes path/to/design --no-gui              # interactive console without a window
+```
+
+The main step commands (`help` lists all, `help <cmd>` explains one):
+
+| Command | What it does |
+|---|---|
+| `place [route=1] [density= iters= ...]` | Global placement with timing and routability feedback (the global router is the congestion oracle), then legalization. `route=1` also routes the result |
+| `global_place [...]` | Global placement only |
+| `legalize [macros=0] [cells=0] [region=x0,y0,x1,y1]` | Legalize the current placement (macros, then std cells); with `region` (microns) only cells inside it move |
+| `global_route [mode=auto\|full\|incremental] [region=...]` | Route the current placement, any placed design (e.g. straight from DEF). `auto`: incremental when routes exist, so after a small edit only the affected nets are rerouted |
+| `timing [clock=PS]` | STA on the current placement: WNS / TNS |
+| `qor`, `report [file]` | QoR report (congestion from the global routes when they exist) |
+| `flow` | `place` + `global_route` + `timing` + `qor` in one job |
+| `save <file.hdb\|.def\|.pl\|.aux>` | Save or write the design |
+| `results`, `source <file>`, `open <path>`, `cancel`, `wait` | |
+
+Each step runs as a background job, so the GUI stays usable while it runs. In
+a command file each step waits for the previous one to finish, so no `wait`
+lines are needed; in the GUI console a step typed while a job runs is queued
+behind it (view commands run at once; `cancel` stops the job and drops the
+queue). A failing command or job stops a command file.
+
+Engine state that lives between steps (the global router's routes, the clock
+period) is kept by the session in `FlowEngines` (`hermes/flow/steps.hpp`),
+never in `Design`. Steps that move most cells drop the routes; small edits
+keep them, and the next `global_route` is incremental.
+
+Without a display (or a hermes built without GLFW), `hermes <design>` falls
+back to the headless console. Log options (`--log`, `-q`, ...) can be given
+anywhere on the line. Long options also take one dash (`-script`, `-no-gui`).
+
 ## Layout
 
 ```
@@ -91,7 +134,7 @@ APIs; without it the MCP server and the offline mock assistant still work.
 cmake -S . -B build
 cmake --build build -j
 ctest --test-dir build --output-on-failure
-./build/hermes demo
+./build/hermes --synth 20000 --no-gui -c "flow; results"
 ```
 
 ### Python
@@ -254,9 +297,9 @@ new format, or a newer Bookshelf variant, is one class added to the registry.
 
 ### Running on a directory
 
-    hermes path/to/design_dir                 # detect inputs, place, route, save
+    hermes path/to/design_dir                 # detect inputs and load them (GUI)
     hermes detect path/to/design_dir          # only show what would be read
-    hermes run --lef tech.lef --lef cells.lef --def top.def    # explicit LEF/DEF
+    hermes load --lef tech.lef --lef cells.lef --def top.def   # explicit LEF/DEF (also: convert)
 
 What gets read:
 
@@ -279,9 +322,8 @@ What gets read:
 
 A single `.def`, `.aux` or `.hdb` file (or a manifest path) works as input too.
 
-Output goes to `--out` (default `hermes_out/<design>`): `<design>.hdb` at the
-end of the run, plus `--write FILE` for `.def`, `.pl`, `.aux` or `.hdb`, and
-`--checkpoint` for `<design>.placed.hdb` after placement.
+Nothing is written unless a command says so: `save out/design.hdb`,
+`save out/design.def`, `report out/design.qor.txt`.
 `hermes convert <input> out.hdb out.def out.pl` converts without running.
 
 Kept from the input: DEF `PLACED`/`FIXED` locations and orientations are
@@ -404,7 +446,7 @@ accumulation; same report for any thread count, tested).
 
 ## Run tracking and dashboard
 
-Every `hermes` run (and `hermes demo`) is registered in a local SQLite
+Every batch run (`hermes <design> --no-gui -c ...` or `-s file`) is registered in a local SQLite
 database, `~/.hermes/runs.db` (`--track-db PATH`, env `HERMES_RUNS_DB`,
 `--no-track` to skip): settings, input, command line, source version (`git
 describe`, or a hash of the sources), host, OS, CPU, cores, memory, threads,
@@ -415,7 +457,7 @@ shows as "lost" once its heartbeat stops. Ctrl-C cancels at the next safe
 point and records the run as cancelled.
 
 ```bash
-hermes design_dir --run-name "td 0.65" --tag sweep --tag adaptec2
+hermes design_dir --no-gui -c flow --run-name "td 0.65" --tag sweep --tag adaptec2
 python3 tools/dashboard/hermes_dashboard.py           # http://localhost:8765
 ```
 
@@ -469,7 +511,7 @@ cmake -S . -B build && cmake --build build -j --target hermes_gui
 ./build/hermes_gui                                  # empty window: open or generate a design
 ./build/hermes_gui path/to/design_dir               # anything `hermes <path>` reads (.hdb is fastest)
 ./build/hermes_gui --synth 1000000                  # synthetic 1M-cell design
-./build/hermes_gui d.hdb -c "run; heatmap density"  # console commands after start
+./build/hermes_gui d.hdb -c "flow; heatmap density" # console commands after start (same as `hermes d.hdb -c ...`)
 ./build/hermes_gui --bench                          # frame-time benchmark on 1M cells (writes hermes_gui_bench.json)
 ./build/hermes_gui d.hdb --screenshot view.png      # render once, save a PNG, quit (add --hidden for no window)
 ```
@@ -534,11 +576,14 @@ since that report.
 ### Console and scripting
 
 One command registry serves the console, `-c`/`--script`, `hermes shell`,
-Python (`hermes.Console`) and the AI assistant's tools. `help` lists commands: `open synth run place cancel wait
-settle qor report save select find clear zoom zoomfrac layer layers heatmap
-heatmaps move undo info threads screenshot panel frames sleep bench_frames
-bench_report echo quit`. Commands that change the design are marked and
-refused while a job runs. There is no embedded Python interpreter yet; the
+Python (`hermes.Console`) and the AI assistant's tools. `help` lists commands: the steps
+(`place global_place legalize global_route timing qor flow`), `open synth
+cancel wait settle report results save write source select find clear zoom
+zoomfrac layer layers heatmap heatmaps move undo info threads screenshot panel
+frames sleep bench_frames bench_report echo quit`. One `ScriptRunner`
+(`gui/scene/commands.hpp`) runs startup commands, command files, queued
+console input and the headless modes the same way: a step waits for the
+running job first. There is no embedded Python interpreter yet; the
 Python API (`import hermes`) remains the scripting route for engines.
 
 ### Rendering backends
@@ -735,8 +780,8 @@ Control it from the CLI, the environment, C++ or Python:
 
 ```bash
 ./build/hermes --log "warn,place.gp=verbose,route=debug" --log-msg DEF-0002=5 \
-               --log-file run.log --log-json run.jsonl demo
-HERMES_LOG="info,io.def=off,msg:*=20" ./build/hermes demo   # msg:*=N caps every id
+               --log-file run.log --log-json run.jsonl --synth 20000 --no-gui -c flow
+HERMES_LOG="info,io.def=off,msg:*=20" ./build/hermes design --no-gui -c flow   # msg:*=N caps every id
 ./build/hermes --log-channels                                # list channels
 ```
 

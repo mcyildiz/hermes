@@ -18,6 +18,10 @@ CongestionMap::CongestionMap(const Rect& region, int nx, int ny,
 
 void CongestionMap::clear_demand() { std::fill(demand_.begin(), demand_.end(), 0.0); }
 
+void CongestionMap::scale_demand(double f) {
+  for (double& d : demand_) d *= f;
+}
+
 double CongestionMap::utilization(int ix, int iy) const {
   const double cap = capacity(ix, iy);
   return cap > 0.0 ? demand(ix, iy) / cap : (demand(ix, iy) > 0.0 ? 1e9 : 0.0);

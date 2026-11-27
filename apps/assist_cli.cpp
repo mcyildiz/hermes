@@ -16,6 +16,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -130,22 +131,79 @@ void drive(AiHost& ai, gui::Session& s, gui::ViewApi& v, std::size_t& shown) {
 
 int cmd_shell(int argc, char** argv, int i) {
   Common c = parse_common(argc, argv, i, false);
+  ShellArgs a;
+  a.input = c.input;
+  a.opts = c.opts;
+  a.runs_db = c.runs_db;
+  a.ai_config = c.config;
+  return run_shell(a);
+}
+
+int run_shell(const ShellArgs& args) {
   gui::Session s;
+  if (args.threads > 0) s.set_job_threads(args.threads);
   HeadlessView v(s);
   gui::CommandRegistry reg;
-  AiHost ai(load_assistant_config(c.config));
-  if (!c.runs_db.empty()) ai.config().runs_db = c.runs_db;
+  AiHost ai(load_assistant_config(args.ai_config));
+  if (!args.runs_db.empty()) ai.config().runs_db = args.runs_db;
   ai.register_commands(reg);
-  if (!load(s, c)) return 2;
   std::signal(SIGINT, on_shell_sigint);
-  std::printf("hermes shell. 'help' lists commands; 'ai <question>' or '? <question>' asks the assistant (%s).\n",
-              ai.config().enabled ? "on" : "off; see 'ai status'");
+  const bool tty = isatty(0);
   gui::CommandContext ctx{s, v};
+  gui::ScriptRunner sr;
+  bool said_waiting = false;
+  auto echo = [&](const std::string&, const gui::CommandResult& r) {
+    if (!r.text.empty()) std::fprintf(r.ok ? stdout : stderr, "%s\n", r.text.c_str());
+    std::fflush(stdout);
+  };
+  // Runs queued lines until the queue is empty (a job may still run, unless
+  // `drain`: then until it ends too). Ctrl-C cancels the job and the queue.
+  auto pump = [&](bool drain) {
+    g_interrupts = 0;
+    said_waiting = false;
+    while (true) {
+      sr.step(ctx, reg, echo);
+      if (sr.failed()) {
+        std::fprintf(stderr, "stopped: %s\n", sr.error().c_str());
+        sr = gui::ScriptRunner{};
+        break;
+      }
+      if (sr.idle() && (!drain || !s.busy())) {
+        if (drain) sr.step(ctx, reg, echo);
+        break;
+      }
+      if (!said_waiting && s.busy()) {
+        std::printf("(waiting for %s; Ctrl-C cancels)\n", s.job_kind().c_str());
+        std::fflush(stdout);
+        said_waiting = true;
+      }
+      if (g_interrupts.exchange(0)) {
+        s.cancel();
+        if (sr.pending()) std::printf("cancelled; dropped %zu queued command(s)\n", sr.pending());
+        sr.clear();
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+    s.poll();
+  };
+  if (!args.input.empty()) {
+    std::string line = "open \"" + args.input + "\"";
+    for (const auto& [k, val] : args.opts.all()) line += " " + k + "=" + val;
+    sr.push(line);
+  }
+  sr.add(args.startup);
+  pump(true);
+  if (tty)
+    std::printf("hermes shell. 'help' lists commands; steps run in the background and the next step waits for "
+                "them. 'ai <question>' or '? <question>' asks the assistant (%s).\n",
+                ai.config().enabled ? "on" : "off; see 'ai status'");
   std::size_t shown = 0;
   std::string line;
   while (true) {
-    std::printf("hermes> ");
-    std::fflush(stdout);
+    if (tty) {
+      std::printf("hermes> ");
+      std::fflush(stdout);
+    }
     if (!std::getline(std::cin, line)) {
       if (g_interrupts.exchange(0) && std::cin.eof() == false) {
         std::cin.clear();
@@ -157,25 +215,20 @@ int cmd_shell(int argc, char** argv, int i) {
     s.poll();
     if (line == "quit" || line == "exit") break;
     if (line.starts_with("?")) line = "ai " + line.substr(1);
-    gui::CommandResult r = reg.run(ctx, line);
-    if (!r.text.empty()) std::fprintf(r.ok ? stdout : stderr, "%s\n", r.text.c_str());
-    if (r.wait_until) {
-      g_interrupts = 0;
-      while (!r.wait_until()) {
-        s.poll();
-        if (g_interrupts.exchange(0)) s.cancel();
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-      }
-    }
+    sr.push(line);
+    pump(false);
     const auto w = gui::split_command_line(line);
-    if (r.ok && !w.empty() && w[0] == "ai") drive(ai, s, v, shown);
+    if (!w.empty() && w[0] == "ai") drive(ai, s, v, shown);
     if (v.quit_requested()) break;
   }
+  // End of input: finish what was started (Ctrl-C cancels).
+  pump(true);
   if (s.busy()) {
     s.cancel();
     s.wait();
   }
-  return 0;
+  const gui::JobEnd* e = s.last_end();
+  return e && e->state == JobState::Failed ? 1 : 0;
 }
 
 int cmd_mcp(int argc, char** argv, int i) {

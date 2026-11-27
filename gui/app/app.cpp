@@ -169,10 +169,8 @@ std::string App::um(Dbu v) const {
 
 // --- Commands / script --------------------------------------------------------
 
-void App::run_command(const std::string& line, bool echo) {
+void App::show_result(const std::string& line, const CommandResult& r, bool echo) {
   if (echo) console.push_back({"> " + line, 1});
-  CommandContext ctx{session, *this};
-  CommandResult r = commands.run(ctx, line);
   if (!r.text.empty()) {
     std::size_t b = 0;
     while (b <= r.text.size()) {
@@ -181,31 +179,67 @@ void App::run_command(const std::string& line, bool echo) {
       console.push_back({r.text.substr(b, e - b), r.ok ? 0 : 2});
       b = e + 1;
     }
-    if ((script_running() || exit_after_script_) && !line.starts_with("screenshot"))
+    if (exit_after_script_ && !line.starts_with("screenshot"))
       std::printf("%s%s\n", r.ok ? "" : "error: ", r.text.c_str());
   }
-  if (!r.ok && !script_running()) toast(r.text, 2);
-  if (r.wait_until) script_wait_ = std::move(r.wait_until);
+  if (!r.ok) toast(r.text, 2);
   while (console.size() > 4000) console.pop_front();
 }
 
-void App::add_script(const std::vector<std::string>& lines) {
-  for (const auto& l : lines) script_.push_back(l);
+void App::execute(const std::string& line, bool echo) {
+  CommandContext ctx{session, *this};
+  const CommandResult r = commands.run(ctx, line);
+  show_result(line, r, echo);
+  if (r.ok && !r.insert_lines.empty()) script_.add(r.insert_lines);
 }
+
+void App::run_command(const std::string& line, bool echo) {
+  const auto w = split_command_line(line);
+  if (w.empty()) return;
+  const Command* c = commands.find(w[0]);
+  if (!c || c->immediate || w[0] == "quit") {
+    execute(line, echo);
+    if (w[0] == "cancel" && script_.pending()) {
+      console.push_back({std::format("dropped {} queued command(s)", script_.pending()), 0});
+      script_.clear();
+    }
+    return;
+  }
+  if (session.busy() || !script_.idle()) {
+    if (echo) console.push_back({"> " + line, 1});
+    console.push_back({"queued: runs when " + (session.busy() ? session.job_kind() : std::string("the queue")) +
+                           " is done ('cancel' drops the queue)",
+                       0});
+    script_.push(line + " ");  // trailing space: already echoed
+    return;
+  }
+  script_.push(line);
+  step_script();
+}
+
+void App::add_script(const std::vector<std::string>& lines) { script_.add(lines); }
 
 void App::step_script() {
   if (!screenshot_path_.empty()) return;
-  if (script_wait_) {
-    if (!script_wait_()) return;
-    script_wait_ = nullptr;
-  }
-  while (!script_.empty() && !script_wait_ && screenshot_path_.empty()) {
-    const std::string line = script_.front();
-    script_.pop_front();
+  CommandContext ctx{session, *this};
+  script_.step(ctx, commands, [this](const std::string& line, const CommandResult& r) {
+    const bool echoed = !line.empty() && line.back() == ' ';
     if (exit_after_script_) std::printf("> %s\n", line.c_str());
-    run_command(line, true);
+    show_result(line, r, !echoed);
+  });
+  if (script_.failed()) {
+    const std::string msg = "commands stopped: " + script_.error();
+    console.push_back({msg, 2});
+    toast(msg, 2);
+    if (exit_after_script_) {
+      std::fprintf(stderr, "hermes: %s\n", msg.c_str());
+      exit_code_ = 1;
+      quit_ = true;
+    }
+    script_ = ScriptRunner{};
+    return;
   }
-  if (script_.empty() && !script_wait_ && screenshot_path_.empty() && exit_after_script_) quit_ = true;
+  if (exit_after_script_ && script_.idle() && !session.busy() && screenshot_path_.empty()) quit_ = true;
 }
 
 void App::pull_log() {

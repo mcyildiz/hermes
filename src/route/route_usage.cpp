@@ -79,18 +79,93 @@ LayerStack layer_stack_for(const Design& d, const RouteUsageOptions& o) {
   return st;
 }
 
+BinGrid route_gcell_grid(const Design& d, const RouteUsageOptions& o) {
+  const RouteGrid& rg = d.route_grid();
+  if (!rg.empty() && o.use_route_grid) {
+    const Rect r{rg.origin.x, rg.origin.y, rg.origin.x + rg.nx * rg.tile_w, rg.origin.y + rg.ny * rg.tile_h};
+    return BinGrid(r, rg.nx, rg.ny);
+  }
+  return BinGrid(d.die(), std::max(1, o.grid_x), std::max(1, o.grid_y));
+}
+
+std::vector<std::vector<float>> layer_capacity(const Design& d, const LayerStack& stack, const BinGrid& g,
+                                               const RouteUsageOptions& o) {
+  const RouteGrid& rg = d.route_grid();
+  const bool from_file = o.use_route_grid && !rg.empty() && stack.source == "route file";
+  const int L = stack.num_layers();
+  const int nx = g.nx(), ny = g.ny();
+  const std::size_t ng = g.size();
+  std::vector<std::vector<float>> capacity(static_cast<std::size_t>(L), std::vector<float>(ng, 0.0f));
+  // Blocked fraction per gcell and layer.
+  std::vector<std::vector<float>> blocked(static_cast<std::size_t>(L));
+  auto block = [&](const Rect& bb, int layer) {
+    if (layer < 0 || layer >= L) return;
+    auto& b = blocked[static_cast<std::size_t>(layer)];
+    if (b.empty()) b.assign(ng, 0.0f);
+    g.for_each_bin(bb, [&](int ix, int iy) {
+      const Rect br = g.bin_rect(ix, iy);
+      const double a = static_cast<double>(br.area());
+      if (a > 0) b[g.index(ix, iy)] += static_cast<float>(static_cast<double>(br.overlap_area(bb)) / a);
+    });
+  };
+  if (from_file && rg.num_blockages() > 0) {
+    for (std::size_t i = 0; i < rg.num_blockages(); ++i) {
+      const Id c = rg.blockage_cell[i];
+      if (c == kInvalidId || static_cast<std::size_t>(c) >= d.num_cells() || d.cell(c).removed) continue;
+      for (std::uint32_t k = rg.blockage_begin[i]; k < rg.blockage_begin[i + 1]; ++k)
+        block(d.cell(c).bbox(), rg.blockage_layers[k] - 1);
+    }
+  } else {
+    const int nb = std::clamp(o.macro_blocked_layers, 0, std::max(0, L - 2));
+    for (const Cell& c : d.cells()) {
+      if (!c.is_macro || c.removed) continue;
+      for (int l = 0; l < nb; ++l) block(c.bbox(), l);
+    }
+  }
+  std::atomic<std::size_t> snapped{0};
+  par::parallel_for_each(0, static_cast<std::size_t>(L), [&](std::size_t l) {
+    const LayerInfo& li = stack.layers[l];
+    if (!li.routable) return;
+    double file_tracks = -1.0;
+    if (from_file) {
+      const auto& cap = li.dir == LayerDir::Horizontal ? rg.horizontal_capacity : rg.vertical_capacity;
+      file_tracks = l < cap.size() ? cap[l] / static_cast<double>(std::max<Dbu>(1, li.pitch)) : 0.0;
+    }
+    std::size_t sn = 0;
+    for (int iy = 0; iy < ny; ++iy)
+      for (int ix = 0; ix < nx; ++ix) {
+        const Rect br = g.bin_rect(ix, iy);
+        double t = file_tracks >= 0.0
+                       ? file_tracks
+                       : static_cast<double>(li.dir == LayerDir::Horizontal ? br.height() : br.width()) /
+                             static_cast<double>(li.pitch);
+        if (!blocked[l].empty()) {
+          // Overlapping macros can sum past 1, and float sums of a fully
+          // covered GCell land just below 1 (e.g. 0.99999994): that left a
+          // capacity of ~1e-6 tracks and utilizations of 1e7 (adaptec2 M4).
+          const double bf = static_cast<double>(blocked[l][g.index(ix, iy)]);
+          if (bf >= 1.0 - 1e-4) {
+            sn += bf < 1.0;
+            t = 0.0;
+          } else {
+            t *= 1.0 - bf;
+          }
+        }
+        if (t < 1e-3) t = 0.0;
+        capacity[l][g.index(ix, iy)] = static_cast<float>(t);
+      }
+    snapped.fetch_add(sn, std::memory_order_relaxed);
+  });
+  HLOG_DEBUG(log_usage, "layer capacity: {}x{} GCells, {} layers ({}), {} nearly-blocked GCell layers snapped to 0",
+             nx, ny, L, stack.source, snapped.load());
+  return capacity;
+}
+
 RouteUsage3D build_route_usage(const Design& d, const RouteUsageOptions& o) {
   RouteUsage3D u;
   u.stack = layer_stack_for(d, o);
-  const RouteGrid& rg = d.route_grid();
-  const bool from_file = o.use_route_grid && !rg.empty() && u.stack.source == "route file";
-  if (!rg.empty() && o.use_route_grid) {
-    const Rect r{rg.origin.x, rg.origin.y, rg.origin.x + rg.nx * rg.tile_w, rg.origin.y + rg.ny * rg.tile_h};
-    u.grid = BinGrid(r, rg.nx, rg.ny);
-  } else {
-    u.grid = BinGrid(d.die(), std::max(1, o.grid_x), std::max(1, o.grid_y));
-  }
-  u.source = "global router (star + L-shape) with greedy length-based layer assignment";
+  u.grid = route_gcell_grid(d, o);
+  u.source = "estimate (star + L-shape) with greedy length-based layer assignment";
   const BinGrid& g = u.grid;
   const int nx = g.nx(), ny = g.ny();
   const std::size_t ng = g.size();
@@ -107,55 +182,7 @@ RouteUsage3D build_route_usage(const Design& d, const RouteUsageOptions& o) {
   if (hl.empty()) hl = vl;
   if (vl.empty()) vl = hl;
 
-  // Capacity.
-  u.capacity.assign(static_cast<std::size_t>(L), std::vector<float>(ng, 0.0f));
-  {
-    // Blocked fraction per gcell and layer.
-    std::vector<std::vector<float>> blocked(static_cast<std::size_t>(L));
-    auto block = [&](const Rect& bb, int layer) {
-      if (layer < 0 || layer >= L) return;
-      auto& b = blocked[static_cast<std::size_t>(layer)];
-      if (b.empty()) b.assign(ng, 0.0f);
-      g.for_each_bin(bb, [&](int ix, int iy) {
-        const Rect br = g.bin_rect(ix, iy);
-        const double a = static_cast<double>(br.area());
-        if (a > 0) b[g.index(ix, iy)] += static_cast<float>(static_cast<double>(br.overlap_area(bb)) / a);
-      });
-    };
-    if (from_file && rg.num_blockages() > 0) {
-      for (std::size_t i = 0; i < rg.num_blockages(); ++i) {
-        const Id c = rg.blockage_cell[i];
-        if (c == kInvalidId || static_cast<std::size_t>(c) >= d.num_cells() || d.cell(c).removed) continue;
-        for (std::uint32_t k = rg.blockage_begin[i]; k < rg.blockage_begin[i + 1]; ++k)
-          block(d.cell(c).bbox(), rg.blockage_layers[k] - 1);
-      }
-    } else {
-      const int nb = std::clamp(o.macro_blocked_layers, 0, std::max(0, L - 2));
-      for (const Cell& c : d.cells()) {
-        if (!c.is_macro || c.removed) continue;
-        for (int l = 0; l < nb; ++l) block(c.bbox(), l);
-      }
-    }
-    par::parallel_for_each(0, static_cast<std::size_t>(L), [&](std::size_t l) {
-      const LayerInfo& li = u.stack.layers[l];
-      if (!li.routable) return;
-      double file_tracks = -1.0;
-      if (from_file) {
-        const auto& cap = li.dir == LayerDir::Horizontal ? rg.horizontal_capacity : rg.vertical_capacity;
-        file_tracks = l < cap.size() ? cap[l] / static_cast<double>(std::max<Dbu>(1, li.pitch)) : 0.0;
-      }
-      for (int iy = 0; iy < ny; ++iy)
-        for (int ix = 0; ix < nx; ++ix) {
-          const Rect br = g.bin_rect(ix, iy);
-          double t = file_tracks >= 0.0
-                         ? file_tracks
-                         : static_cast<double>(li.dir == LayerDir::Horizontal ? br.height() : br.width()) /
-                               static_cast<double>(li.pitch);
-          if (!blocked[l].empty()) t *= std::max(0.0, 1.0 - static_cast<double>(blocked[l][g.index(ix, iy)]));
-          u.capacity[l][g.index(ix, iy)] = static_cast<float>(t);
-        }
-    });
-  }
+  u.capacity = layer_capacity(d, u.stack, g, o);
 
   // Demand: covered length (DBU) per layer and gcell, accumulated with
   // integer atomics so the result is independent of thread count and order.

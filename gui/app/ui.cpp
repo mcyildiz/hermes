@@ -146,10 +146,18 @@ void top_bar(App& app, float W) {
   if (ImGui::Button("Open")) ImGui::OpenPopup("open");
   ImGui::SameLine();
   ImGui::BeginDisabled(!s.has_design());
-  if (ImGui::Button("Run flow")) app.run_command("run");
-  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Place, route, STA and QoR in the background. The view updates live.");
-  ImGui::SameLine();
   if (ImGui::Button("Place")) app.run_command("place");
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Global placement with timing and routability feedback, then legalization (command: place)");
+  ImGui::SameLine();
+  if (ImGui::Button("Route")) app.run_command("global_route");
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Global route the current placement; incremental when routes exist (command: global_route)");
+  ImGui::SameLine();
+  if (ImGui::Button("Timing")) app.run_command("timing");
+  ImGui::SameLine();
+  if (ImGui::Button("Flow")) app.run_command("flow");
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Place, route, timing and QoR in one background job (command: flow)");
   ImGui::SameLine();
   if (ImGui::Button("QoR")) app.run_command("qor");
   if (ImGui::IsItemHovered()) ImGui::SetTooltip("Compute the QoR report: density, congestion and wirelength maps");
@@ -542,18 +550,26 @@ void inspector_panel(App& app, float x, float y, float h) {
     if (ImGui::Button("Clear  Esc")) app.clear_selection();
   }
 
-  // Results.
-  if (auto f = s.last_flow()) {
+  // Results of the last steps (place, global_route, timing, or a flow).
+  if (s.last_placement() || s.last_route() || s.last_timing() || s.last_legalize()) {
     ImGui::Spacing();
     ImGui::Separator();
-    section("LAST RUN");
+    section("RESULTS");
     const char* unit = app.dbu_per_um() > 0 ? " um" : "";
-    ImGui::Text("HPWL %s%s", app.um(static_cast<Dbu>(f->placement.hpwl)).c_str(), unit);
-    ImGui::Text("WNS %.1f ps   TNS %.1f ps", f->final_wns_ps, f->final_tns_ps);
-    for (const auto& [stage, sec] : f->stage_seconds) {
-      ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-      ImGui::Text("%-16s %7.2f s", stage.c_str(), sec);
-      ImGui::PopStyleColor();
+    if (auto p = s.last_placement())
+      ImGui::Text("Placement HPWL %.6g%s", p->hpwl, p->cancelled ? " (cancelled)" : "");
+    if (auto l = s.last_legalize())
+      ImGui::Text("Legalized %d cells, %s", l->cells.legalized, l->legal ? "legal" : "NOT legal");
+    if (auto r = s.last_route())
+      ImGui::Text("Route WL %s%s  overflow %.0f%s", app.um(static_cast<Dbu>(r->stats.wirelength)).c_str(), unit,
+                  r->stats.total_overflow, r->incremental ? " (incr.)" : "");
+    if (auto t = s.last_timing()) ImGui::Text("WNS %.1f ps   TNS %.1f ps", t->wns_ps, t->tns_ps);
+    if (auto f = s.last_flow()) {
+      for (const auto& [stage, sec] : f->stage_seconds) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+        ImGui::Text("%-16s %7.2f s", stage.c_str(), sec);
+        ImGui::PopStyleColor();
+      }
     }
   }
   if (auto q = s.qor()) {
@@ -644,8 +660,8 @@ void console_panel(App& app, float x, float y, float w, float h) {
     ImGui::SetKeyboardFocusHere();
     refocus = false;
   }
-  const char* hint = app.session.busy() ? "command (a job is running: view and read-only commands only)"
-                                        : "command (help, open, run, select, layer, heatmap, ...)";
+  const char* hint = app.session.busy() ? "command (a job is running: view commands run now, steps are queued)"
+                                        : "command (help, place, global_route, timing, qor, save, source, ...)";
   if (ImGui::InputTextWithHint("##in", hint, g_console, sizeof g_console,
                                ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackHistory |
                                    ImGuiInputTextFlags_CallbackCompletion,

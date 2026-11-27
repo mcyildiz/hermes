@@ -207,7 +207,7 @@ const SUMMARY_COLS = [
 async function viewRuns() {
   const q = $("#q").value.trim();
   const runs = await api("api/runs?limit=300" + (q ? "&q=" + encodeURIComponent(q) : ""));
-  if (!runs.length) { $("#main").innerHTML = `<div class="panel empty">No runs yet. Run <span class="mono">hermes demo</span> or <span class="mono">hermes &lt;design_dir&gt;</span>; each run appears here live.</div>`; return; }
+  if (!runs.length) { $("#main").innerHTML = `<div class="panel empty">No runs yet. Run <span class="mono">hermes &lt;design_dir&gt; --no-gui -c flow</span>; each run appears here live.</div>`; return; }
   const rows = runs.map(r => {
     const s = r.summary || {}, dbu = s.dbu_per_micron;
     const prog = r.status === "running"

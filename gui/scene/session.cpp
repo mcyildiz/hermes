@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <filesystem>
+#include <format>
 
 #include "hermes/io/design_file.hpp"
 #include "hermes/io/registry.hpp"
@@ -13,6 +15,7 @@
 namespace hermes::gui {
 
 HERMES_LOG_CHANNEL(log_gui, "gui");
+HERMES_LOG_CHANNEL(log_cmd, "cmd");
 
 namespace {
 double now_s() {
@@ -35,15 +38,8 @@ std::shared_ptr<TechInfo> make_tech_info(const Design& d, const GlobalRouterOpti
   o.first_routing_layer = router.first_routing_layer;
   o.macro_blocked_layers = router.macro_blocked_layers;
   LayerStack st = layer_stack_for(d, o);
-  // Same GCell grid as build_route_usage().
-  BinGrid g;
-  const RouteGrid& rg = d.route_grid();
-  if (!rg.empty() && o.use_route_grid) {
-    g = BinGrid({rg.origin.x, rg.origin.y, rg.origin.x + rg.nx * rg.tile_w, rg.origin.y + rg.ny * rg.tile_h}, rg.nx,
-                rg.ny);
-  } else {
-    g = BinGrid(d.die(), std::max(1, o.grid_x), std::max(1, o.grid_y));
-  }
+  // Same GCell grid as the global router.
+  const BinGrid g = GlobalRouter(router).gcell_grid(d);
   auto t = std::make_shared<TechInfo>();
   t->wires_source = "Estimated: global router stub (star + L-shape), greedy layer assignment; layers from " + st.source;
   t->routes = EstimatedRouteModel(std::move(st), g);
@@ -113,6 +109,11 @@ void Session::install(std::unique_ptr<Loaded> l) {
   load_seconds_ = l->seconds;
   flow_report_done_.reset();
   qor_.reset();
+  placement_.reset();
+  legalize_.reset();
+  route_.reset();
+  timing_.reset();
+  engines_ = std::make_unique<FlowEngines>();
   undo_.clear();
   ++generation_;
 }
@@ -192,63 +193,86 @@ void Session::adopt(Design design, std::string source) {
   install(std::move(l));
 }
 
-bool Session::start_flow(const FlowOptions& opts, std::string* why) {
+bool Session::start_task(std::string kind, SessionTask task, bool edits, std::string* why) {
   if (!has_design()) {
     if (why) *why = "no design loaded";
     return false;
   }
   if (!check_free(why)) return false;
-  undo_.clear();  // The flow changes everything; old undo entries would fight it.
-  job_kind_ = opts.run_routing ? "flow" : "placement";
-  flow_report_ = std::make_shared<FlowReport>();
+  if (edits) undo_.clear();  // The task moves cells; old undo entries would fight it.
+  job_kind_ = kind;
+  job_edits_ = edits;
+  auto out = std::make_shared<TaskOutput>();
+  task_out_ = out;
   JobOptions jo;
   jo.max_threads = job_threads();
   jo.publish_interval_s = 0.2;
-  job_ = start_flow_job(*design_, opts, flow_report_.get(), jo);
+  Design* d = design_.get();
+  FlowEngines* eng = engines_.get();
+  job_ = start_job(
+      kind,
+      [d, eng, out, edits, task = std::move(task)](RunControl& ctl) {
+        task(*d, *eng, ctl, *out);
+        // Whatever an editing task left unflushed reaches the snapshots. A
+        // read-only task (route, timing, QoR) must not flush: that bumps the
+        // design version and would mark the routes as out of date.
+        if (edits) d->flush();
+      },
+      jo);
   return true;
 }
 
-bool Session::start_qor(std::string* why) {
-  if (!has_design()) {
-    if (why) *why = "no design loaded";
-    return false;
-  }
-  if (!check_free(why)) return false;
-  job_kind_ = "qor";
-  qor_pending_ = std::make_shared<QorReport>();
-  JobOptions jo;
-  jo.max_threads = job_threads();
-  auto out = qor_pending_;
-  Design* d = design_.get();
-  job_ = start_job(
+bool Session::start_flow(const FlowOptions& opts, std::string* why) {
+  const std::string kind = opts.run_routing ? "flow" : "placement";
+  return start_task(
+      kind,
+      [opts](Design& d, FlowEngines& eng, RunControl& ctl, TaskOutput& out) {
+        auto r = std::make_shared<FlowReport>(run_flow(d, eng, opts, &ctl));
+        out.placement = r->placement;
+        if (opts.run_routing && !r->cancelled) {
+          RouteStepResult rs;
+          rs.stats = r->global_route;
+          out.route = rs;
+        }
+        if (!r->cancelled) {
+          TimingStepResult t;
+          t.wns_ps = r->final_wns_ps;
+          t.tns_ps = r->final_tns_ps;
+          t.clock_period_ps = eng.clock_period_ps;
+          out.timing = t;
+        }
+        if (r->has_qor) out.qor = std::make_shared<QorReport>(r->qor);
+        out.flow = std::move(r);
+      },
+      true, why);
+}
+
+bool Session::start_qor(std::string* why, QorOptions opts) {
+  return start_task(
       "qor",
-      [d, out](RunControl& ctl) {
+      [opts](Design& d, FlowEngines& eng, RunControl& ctl, TaskOutput& out) {
         ctl.begin_stage("qor", 0.0, 1.0);
-        *out = compute_qor(*d);  // Reads the design; no writer runs meanwhile.
+        out.qor = std::make_shared<QorReport>(qor_design(d, eng, opts));  // Reads the design only.
+        out.summary = "QoR report ready ('report' prints it)";
       },
-      jo);
-  return true;
+      false, why);
 }
 
-bool Session::save(const std::string& path, std::string* why) {
-  if (!has_design()) {
-    if (why) *why = "no design loaded";
-    return false;
-  }
-  if (!check_free(why)) return false;
-  job_kind_ = "save";
-  JobOptions jo;
-  jo.max_threads = job_threads();
-  Design* d = design_.get();
-  job_ = start_job(
-      "save " + path,
-      [d, path](RunControl&) {
-        const auto r = io::save_design(*d, path);
-        HLOG_INFO(log_gui, "saved {} ({:.1f} MB) in {:.3f} s", path, static_cast<double>(r.file_bytes) / 1e6,
-                  r.seconds);
+bool Session::save(const std::string& path, std::string* why, const io::Options& opts) {
+  return start_task(
+      "save",
+      [path, opts](Design& d, FlowEngines&, RunControl&, TaskOutput& out) {
+        if (std::filesystem::path(path).extension() == ".hdb") {
+          const auto r = io::save_design(d, path);
+          out.summary = std::format("saved {} ({:.1f} MB) in {:.3f} s", path, static_cast<double>(r.file_bytes) / 1e6,
+                                    r.seconds);
+        } else {
+          const double t0 = now_s();
+          io::write_design(d, path, {}, opts);
+          out.summary = std::format("wrote {} in {:.3f} s", path, now_s() - t0);
+        }
       },
-      jo);
-  return true;
+      false, why);
 }
 
 void Session::cancel() {
@@ -270,8 +294,9 @@ void Session::poll() {
     l = std::move(loaded_);
   }
   if (l) install(std::move(l));
+  std::string fail_msg;
   if (st == JobState::Failed) {
-    std::string msg;
+    std::string& msg = fail_msg;
     try {
       job_.rethrow_if_failed();
     } catch (const std::exception& e) {
@@ -283,25 +308,26 @@ void Session::poll() {
   } else if (st == JobState::Cancelled) {
     note(kind + " cancelled", log::Level::Warn);
   }
-  if ((kind == "flow" || kind == "placement") && flow_report_) {
-    if (st == JobState::Done) {
-      flow_report_done_ = flow_report_;
-      if (flow_report_->has_qor) {
-        qor_ = std::make_shared<QorReport>(flow_report_->qor);
-        qor_version_ = design_ ? design_->version() : 0;
-      }
-      note(kind + " finished", log::Level::Info);
-    }
-    flow_report_.reset();
-  }
-  if (kind == "qor" && qor_pending_) {
-    if (st == JobState::Done) {
-      qor_ = qor_pending_;
+  std::shared_ptr<TaskOutput> out = std::move(task_out_);
+  if (out && st == JobState::Done) {
+    if (out->placement) placement_ = std::make_shared<PlacementResult>(*out->placement);
+    if (out->legalize) legalize_ = std::make_shared<LegalizeStepResult>(*out->legalize);
+    if (out->route) route_ = std::make_shared<RouteStepResult>(*out->route);
+    if (out->timing) timing_ = std::make_shared<TimingStepResult>(*out->timing);
+    if (out->flow) flow_report_done_ = out->flow;
+    if (out->qor) {
+      qor_ = out->qor;
       qor_version_ = design_ ? design_->version() : 0;
-      note("QoR report ready", log::Level::Info);
     }
-    qor_pending_.reset();
+    if (!out->summary.empty()) HLOG_INFO(log_cmd, "{}", out->summary);
+    else if (kind != "load") HLOG_INFO(log_cmd, "{} finished", kind);
+  } else if (out && st == JobState::Cancelled && out->placement) {
+    placement_ = std::make_shared<PlacementResult>(*out->placement);  // partial, marked cancelled
   }
+  last_end_.kind = kind;
+  last_end_.state = st;
+  last_end_.error = fail_msg;
+  ++last_end_.serial;
   job_ = {};
   job_kind_.clear();
 }

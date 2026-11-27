@@ -342,6 +342,207 @@ void test_legalize_random_mixed_size() {
   CHECK(legal(d, 100));
 }
 
+// Rows with a site grid that does not start at 0 and a gap between subrows.
+void test_abacus_rows_and_sites() {
+  Design d;
+  d.set_die({0, 0, 1000, 100});
+  std::vector<Row> rows;
+  for (Dbu y = 0; y < 100; y += 10) {
+    rows.push_back({{5, y}, 20, 10, 20, 24, Orient::N, kInvalidId});    // [5, 485)
+    rows.push_back({{605, y}, 20, 10, 20, 19, Orient::N, kInvalidId});  // [605, 985)
+  }
+  d.set_rows(std::move(rows));
+  std::mt19937 rng(3);
+  std::uniform_int_distribution<Dbu> px(0, 960), py(0, 90);
+  std::vector<Id> ids;
+  for (int i = 0; i < 30; ++i) {
+    const Id c = d.add_cell("u" + std::to_string(i), 25, 10);  // 1.25 sites: takes 2
+    d.move_cell(c, {px(rng), py(rng)});
+    ids.push_back(c);
+  }
+  const CellLegalizeResult r = abacus_legalize(d);
+  CHECK(r.failed == 0 && r.legalized == 30);
+  CHECK(legal(d, 10));
+  for (Id c : ids) {
+    const Point p = d.cell(c).loc;
+    CHECK((p.x - 5) % 20 == 0);                  // on the site grid of both subrows
+    CHECK(p.x + 25 <= 485 || p.x >= 605);        // not in the gap
+  }
+  // Without site snapping, x may be anywhere in the spans.
+  CellLegalizerOptions o;
+  o.snap_to_sites = false;
+  d.move_cell(ids[0], {300, 33});
+  abacus_legalize(d, o);
+  CHECK(legal(d, 0));
+}
+
+// Rows that start above die.ylo (die larger than the core).
+void test_abacus_rows_offset_from_die() {
+  Design d;
+  d.set_die({0, 0, 500, 200});
+  std::vector<Row> rows;
+  for (Dbu y = 37; y + 12 <= 160; y += 12) rows.push_back({{0, y}, 1, 12, 1, 500, Orient::N, kInvalidId});
+  d.set_rows(std::move(rows));
+  for (int i = 0; i < 40; ++i) {
+    const Id c = d.add_cell("u" + std::to_string(i), 10, 12);
+    d.move_cell(c, {static_cast<Dbu>(12 * i), static_cast<Dbu>(5 * i % 190)});
+  }
+  const CellLegalizeResult r = abacus_legalize(d);
+  CHECK(r.failed == 0);
+  CHECK(legal(d, 12));
+  for (const Cell& c : d.cells()) CHECK(c.loc.y >= 37 && (c.loc.y - 37) % 12 == 0 && c.loc.y + 12 <= 160);
+}
+
+// Legal start; a few cells moved onto others are legalized alone.
+void test_abacus_cell_list_incremental() {
+  Design d;
+  d.set_die({0, 0, 2000, 200});
+  d.set_row_height(10);
+  std::mt19937 rng(9);
+  std::uniform_int_distribution<Dbu> px(0, 1980), py(0, 190);
+  for (int i = 0; i < 600; ++i) {
+    const Id c = d.add_cell("u" + std::to_string(i), 20, 10);
+    d.move_cell(c, {px(rng), py(rng)});
+  }
+  abacus_legalize(d);
+  CHECK(legal(d, 10));
+  std::vector<Point> before;
+  for (const Cell& c : d.cells()) before.push_back(c.loc);
+  const Id moved[] = {3, 77, 401};
+  d.move_cell(3, d.cell(10).loc);  // right on top of other cells
+  d.move_cell(77, d.cell(11).loc);
+  d.move_cell(401, {1003, 97});
+  CellLegalizerOptions o;
+  o.cells = moved;
+  const CellLegalizeResult r = abacus_legalize(d, o);
+  CHECK(r.legalized == 3 && r.failed == 0);
+  CHECK(legal(d, 10));
+  for (Id i = 0; i < static_cast<Id>(d.num_cells()); ++i) {
+    if (i != 3 && i != 77 && i != 401) CHECK(d.cell(i).loc == before[i]);
+  }
+  // Moving a cell back to where it was legal costs nothing.
+  d.move_cell(77, before[77]);
+  const Id one[] = {77};
+  o.cells = one;
+  const CellLegalizeResult r2 = abacus_legalize(d, o);
+  CHECK(r2.total_displacement == 0.0);
+}
+
+// No room near the cell: the window widens until the cell fits.
+void test_abacus_cell_list_widens_window() {
+  Design d;
+  d.set_die({0, 0, 4000, 400});
+  d.set_row_height(10);
+  // Rows 0..39 completely full except a hole far away at x = 3900, row 35.
+  for (Dbu y = 0; y < 400; y += 10)
+    for (Dbu x = 0; x < 4000; x += 50) {
+      if (y == 350 && x == 3900) continue;
+      const Id c = d.add_cell("f" + std::to_string(y) + "_" + std::to_string(x), 50, 10);
+      d.move_cell(c, {x, y});
+    }
+  const Id c = d.add_cell("late", 50, 10);
+  d.move_cell(c, {100, 20});
+  CHECK(!legal(d, 10));
+  const Id one[] = {c};
+  CellLegalizerOptions o;
+  o.cells = one;
+  o.window_margin_rows = 2;
+  const CellLegalizeResult r = abacus_legalize(d, o);
+  CHECK(r.failed == 0);
+  CHECK(r.attempts > 1);
+  CHECK(d.cell(c).loc == (Point{3900, 350}));
+  CHECK(legal(d, 10));
+}
+
+// A fence: only cells inside it move, and they stay inside.
+void test_abacus_fence() {
+  Design d;
+  d.set_die({0, 0, 1000, 1000});
+  d.set_row_height(10);
+  std::mt19937 rng(4);
+  std::uniform_int_distribution<Dbu> p(0, 980);
+  for (int i = 0; i < 1500; ++i) {
+    const Id c = d.add_cell("u" + std::to_string(i), 20, 10);
+    d.move_cell(c, {p(rng), p(rng)});  // overlapping everywhere
+  }
+  const Rect fence{300, 300, 600, 600};
+  std::vector<Point> before;
+  std::vector<bool> inside;
+  for (const Cell& c : d.cells()) {
+    before.push_back(c.loc);
+    inside.push_back(fence.contains(c.bbox().center()));
+  }
+  CellLegalizerOptions o;
+  o.fence = fence;
+  const CellLegalizeResult r = abacus_legalize(d, o);
+  CHECK(r.failed == 0 && r.legalized > 100);
+  for (Id i = 0; i < static_cast<Id>(d.num_cells()); ++i) {
+    const Cell& c = d.cell(i);
+    if (!inside[i]) {
+      CHECK(c.loc == before[i]);
+      continue;
+    }
+    CHECK(c.loc.x >= 300 && c.loc.x + c.width <= 600 && c.loc.y >= 300 && c.loc.y + c.height <= 600);
+    CHECK(c.loc.y % 10 == 0);
+    // Cells outside the fence are obstacles: no overlap with anything.
+    for (Id j = 0; j < static_cast<Id>(d.num_cells()); ++j) {
+      if (j != i) CHECK(!c.bbox().overlaps(d.cell(j).bbox()));
+    }
+  }
+}
+
+// Cells left on a movable macro by global placement are re-spread before
+// Abacus (mixed-size refinement), which keeps most of the wirelength.
+Design chain_through_macro() {
+  Design d("chain");
+  d.set_die({0, 0, 100000, 100000});
+  d.set_row_height(1000);
+  const Id io_in = d.add_cell("io_in", 1000, 1000);
+  d.move_cell(io_in, {0, 50000});
+  d.set_fixed(io_in, true);
+  const Id io_out = d.add_cell("io_out", 1000, 1000);
+  d.move_cell(io_out, {99000, 50000});
+  d.set_fixed(io_out, true);
+  const Id ram = d.add_cell("ram0", 20000, 20000, true);
+  Id prev = io_in;
+  for (int i = 0; i < 40; ++i) {
+    const Id c = d.add_cell("u" + std::to_string(i), 2000, 1000);
+    const Id n = d.add_net("n" + std::to_string(i));
+    d.connect(prev, n, "Z", {500, 500}, PinDir::Output);
+    d.connect(c, n, "A", {0, 500}, PinDir::Input);
+    prev = c;
+    if (i == 20) {
+      const Id nm = d.add_net("n_ram");
+      d.connect(prev, nm, "Z", {2000, 500}, PinDir::Output);
+      d.connect(ram, nm, "D", {0, 10000}, PinDir::Input);
+      prev = ram;
+    }
+  }
+  const Id nlast = d.add_net("n_out");
+  d.connect(prev, nlast, "Z", {2000, 500}, PinDir::Output);
+  d.connect(io_out, nlast, "A", {0, 500}, PinDir::Input);
+  return d;
+}
+
+void test_refine_after_macro_legalization() {
+  double loss[2] = {0, 0};
+  for (int refine : {0, 1}) {
+    Design d = chain_through_macro();
+    PlacerOptions o;
+    o.detailed_placement = false;
+    if (!refine) o.refine_iterations = 0;
+    MixedSizePlacer p(o);
+    const PlacementResult r = p.run(d, nullptr, nullptr);
+    CHECK(legal(d, 1000));
+    CHECK(r.macro_overlap > 0.01);  // GP left cells on the RAM
+    CHECK((r.refine_iterations > 0) == (refine == 1));
+    loss[refine] = r.hpwl / r.global_hpwl - 1.0;
+  }
+  std::printf("  chain: legalization HPWL loss %.1f%% without refinement, %.1f%% with\n",
+              100 * loss[0], 100 * loss[1]);
+  CHECK(loss[1] < 0.5 * loss[0]);
+}
+
 void test_flow_legal_with_macros() {
   Design d;
   d.set_die({0, 0, 10000, 10000});
@@ -756,6 +957,12 @@ int main() {
       {"abacus_multi_row", test_abacus_multi_row},
       {"abacus_full_rows", test_abacus_full_rows},
       {"legalize_random_mixed_size", test_legalize_random_mixed_size},
+      {"abacus_rows_and_sites", test_abacus_rows_and_sites},
+      {"abacus_rows_offset_from_die", test_abacus_rows_offset_from_die},
+      {"abacus_cell_list_incremental", test_abacus_cell_list_incremental},
+      {"abacus_cell_list_widens_window", test_abacus_cell_list_widens_window},
+      {"abacus_fence", test_abacus_fence},
+      {"refine_after_macro_legalization", test_refine_after_macro_legalization},
       {"flow_legal_with_macros", test_flow_legal_with_macros},
       {"wa_wirelength", test_wa_wirelength},
       {"electrostatics", test_electrostatics},

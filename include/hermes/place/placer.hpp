@@ -45,6 +45,18 @@ struct PlacerOptions {
   double routability_start_overflow = 0.3;
 
   bool legalize = true;
+  /// Mixed-size refinement: once macro legalization has fixed the macros,
+  /// std cells still sitting on them would be pushed off by the legalizer
+  /// in a staircase that costs wirelength. If more than `refine_min_overlap`
+  /// of the std-cell area overlaps a macro, a short global-placement pass
+  /// (macros fixed, fillers and density penalty carried over) re-spreads the
+  /// cells first, for at most `refine_iterations` iterations or until the
+  /// density overflow is below stop_overflow. 0 iterations = off. Designs
+  /// without movable macros never run it.
+  int refine_iterations = 200;
+  double refine_min_overlap = 0.002;
+  /// Starting density penalty = this * the global placer's final penalty.
+  double refine_lambda_scale = 1.0;
   bool detailed_placement = true;
   /// Start cells with Cell::placed (DEF PLACED/FIXED, a placed .pl, a saved
   /// result) at their current location instead of the die center.
@@ -60,6 +72,11 @@ struct PlacementResult {
   double max_utilization = 0.0;
   double density_overflow = 0.0;     ///< Global-placement density overflow at exit.
   double global_hpwl = 0.0;          ///< HPWL right after global placement.
+  /// Fraction of std-cell area on (legalized) macros before refinement, and
+  /// the refinement iterations run (0 = skipped).
+  double macro_overlap = 0.0;
+  int refine_iterations = 0;
+  double legalize_ms = 0.0;          ///< Macro + cell legalization (and refinement) time.
   bool cancelled = false;            ///< Stopped early by RunControl::request_cancel().
 };
 
@@ -83,7 +100,8 @@ struct PlacerState {
 ///        - one Nesterov step, until density overflow < stop_overflow
 ///        - every `timing_interval`:      STA -> net re-weighting
 ///        - every `routability_interval`: router congestion -> cell inflation
-///   3. macro legalization (fix macros)
+///   3. macro legalization (fix macros), then a short refinement pass if
+///      std cells overlap the macros (see PlacerOptions::refine_iterations)
 ///   4. standard-cell legalization
 ///   5. detailed placement
 /// The design is flushed (Design::flush) after each step that writes
@@ -117,6 +135,9 @@ class MixedSizePlacer {
   bool update_routability(Design& design, const GlobalRouter& router,
                           CongestionMap& map);
   void legalize_macros(Design& design);
+  /// Mixed-size refinement after macro legalization; returns iterations run.
+  int refine_after_macros(Design& design, const std::vector<double>& fillers, double lambda,
+                          PlacementResult& res, RunControl* ctl);
   void legalize_cells(Design& design);
   void detailed_place(Design& design);
   void clamp_to_die(Design& design, Id cell) const;
